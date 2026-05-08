@@ -1,0 +1,49 @@
+# Enable proper MIME types for JavaScript modules
+<IfModule mod_mime.c>
+    AddType application/javascript .js
+    AddType text/javascript .js
+</IfModule>
+
+# Handle module scripts correctly
+<IfModule mod_headers.c>
+    <Files "*.js">
+        Header set Content-Type "application/javascript"
+        Header set Cross-Origin-Embedder-Policy "require-corp"
+        Header set Cross-Origin-Opener-Policy "same-origin"
+    </Files>
+</IfModule>
+
+# Ensure proper caching
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType application/javascript "access plus 1 year"
+    ExpiresByType text/javascript "access plus 1 year"
+    ExpiresByType text/css "access plus 1 year"
+    ExpiresByType image/png "access plus 1 month"
+    ExpiresByType image/jpg "access plus 1 month"
+    ExpiresByType image/jpeg "access plus 1 month"
+    ExpiresByType image/gif "access plus 1 month"
+    ExpiresByType image/ico "access plus 1 year"
+    ExpiresByType image/svg "access plus 1 year"
+    ExpiresByType application/json "access plus 0 seconds"
+</IfModule>
+
+# Compress files
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE application/javascript
+    AddOutputFilterByType DEFLATE text/javascript
+    AddOutputFilterByType DEFLATE text/css
+    AddOutputFilterByType DEFLATE text/html
+    AddOutputFilterByType DEFLATE text/xml
+    AddOutputFilterByType DEFLATE application/json
+</IfModule>
+
+# Handle SPA routing
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /
+    RewriteRule ^index\.html$ - [L]
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule . /index.html [L]
+</IfModule>
