@@ -514,7 +514,8 @@ async function listAllConfirmedAppointments({ page = 1, limit = 0, search = '', 
     const countRows = await db.query(countSql, searchParams);
     const total = countRows[0]?.total || 0;
 
-    const dataSql = `SELECT a.*, c.center_name, cl.client_name FROM appointments a LEFT JOIN diagnostic_centers c ON a.center_id = c.id LEFT JOIN clients cl ON a.client_id = cl.id ${whereClause} ORDER BY a.${validSortBy} ${validSortOrder}`;
+    // const dataSql = `SELECT a.*, c.center_name, cl.client_name FROM appointments a LEFT JOIN diagnostic_centers c ON a.center_id = c.id LEFT JOIN clients cl ON a.client_id = cl.id ${whereClause} ORDER BY a.${validSortBy} ${validSortOrder}`;
+    const dataSql = `SELECT a.*, c.center_name as home_center_name, dc2.center_name as other_center_name, cl.client_name FROM appointments a LEFT JOIN diagnostic_centers c ON a.center_id = c.id LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id LEFT JOIN clients cl ON a.client_id = cl.id ${whereClause} ORDER BY a.${validSortBy} ${validSortOrder}`;
 
     const numericLimit = Number(limit);
     const numericPage = Number(page);
