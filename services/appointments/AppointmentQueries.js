@@ -493,9 +493,13 @@ async function listAllConfirmedAppointments({ page = 1, limit = 0, search = '', 
             a.customer_first_name LIKE ? OR 
             a.customer_last_name LIKE ? OR
             a.medical_status LIKE ? 
+            OR
+            c.center_name LIKE ? OR
+            dc2.center_name LIKE ?
         )`);
         const like = `%${search}%`;
-        searchParams.push(like, like, like, like, like);
+        // searchParams.push(like, like, like, like, like);
+        searchParams.push(like, like, like, like, like, like, like);
     }
 
     if (customerCategory) {
@@ -505,7 +509,8 @@ async function listAllConfirmedAppointments({ page = 1, limit = 0, search = '', 
 
     const whereClause = `WHERE ${conditions.join(' AND ')}`;
 
-    const countSql = `SELECT COUNT(*) as total FROM appointments a ${whereClause}`;
+    // const countSql = `SELECT COUNT(*) as total FROM appointments a ${whereClause}`;
+    const countSql = `SELECT COUNT(*) as total FROM appointments a LEFT JOIN diagnostic_centers c ON a.center_id = c.id LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id ${whereClause}`;
     const countRows = await db.query(countSql, searchParams);
     const total = countRows[0]?.total || 0;
 
