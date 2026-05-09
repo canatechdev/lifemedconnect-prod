@@ -197,7 +197,7 @@ const confirmScheduleSchema = Joi.object({
 const rescheduleSchema = Joi.object({
     confirmed_date: Joi.date().required(),
     confirmed_time: Joi.string().pattern(/^([01]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$/).required(),
-    remarks: Joi.string().required().min(10).max(500),
+    reschedule_reason: Joi.string().required().min(10).max(500),
     actor_context: Joi.object({
         centerId: Joi.number().required(),
         type: Joi.string().valid('center', 'technician').optional()
