@@ -94,8 +94,8 @@ async function listAppointmentsByCenter({ page = 1, limit = 0, search = '', cent
             a.customer_first_name LIKE ? OR 
             a.customer_last_name LIKE ? OR
             a.application_number LIKE ? OR
-            dc.center_name LIKE ? OR
-            dc2.center_name LIKE ?
+            home_center.center_name LIKE ? OR
+            other_center.center_name LIKE ?
         )`);
         const like = `%${search}%`;
         searchParams.push(like, like, like, like, like, like);
@@ -161,8 +161,8 @@ async function listAppointmentsByCenter({ page = 1, limit = 0, search = '', cent
         SELECT COUNT(DISTINCT a.id) as total 
         FROM appointments a
         LEFT JOIN appointment_tests at ON a.id = at.appointment_id
-        LEFT JOIN diagnostic_centers dc ON a.center_id = dc.id
-        LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id
+        LEFT JOIN diagnostic_centers home_center ON a.center_id = home_center.id
+        LEFT JOIN diagnostic_centers other_center ON a.other_center_id = other_center.id
         ${whereClause}
     `;
 
@@ -492,13 +492,11 @@ async function listAllConfirmedAppointments({ page = 1, limit = 0, search = '', 
             a.application_number LIKE ? OR
             a.customer_first_name LIKE ? OR 
             a.customer_last_name LIKE ? OR
-            a.medical_status LIKE ? 
-            OR
+            a.medical_status LIKE ? OR
             c.center_name LIKE ? OR
             dc2.center_name LIKE ?
         )`);
         const like = `%${search}%`;
-        // searchParams.push(like, like, like, like, like);
         searchParams.push(like, like, like, like, like, like, like);
     }
 
@@ -509,12 +507,10 @@ async function listAllConfirmedAppointments({ page = 1, limit = 0, search = '', 
 
     const whereClause = `WHERE ${conditions.join(' AND ')}`;
 
-    // const countSql = `SELECT COUNT(*) as total FROM appointments a ${whereClause}`;
     const countSql = `SELECT COUNT(*) as total FROM appointments a LEFT JOIN diagnostic_centers c ON a.center_id = c.id LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id ${whereClause}`;
     const countRows = await db.query(countSql, searchParams);
     const total = countRows[0]?.total || 0;
 
-    // const dataSql = `SELECT a.*, c.center_name, cl.client_name FROM appointments a LEFT JOIN diagnostic_centers c ON a.center_id = c.id LEFT JOIN clients cl ON a.client_id = cl.id ${whereClause} ORDER BY a.${validSortBy} ${validSortOrder}`;
     const dataSql = `SELECT a.*, c.center_name as home_center_name, dc2.center_name as other_center_name, cl.client_name FROM appointments a LEFT JOIN diagnostic_centers c ON a.center_id = c.id LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id LEFT JOIN clients cl ON a.client_id = cl.id ${whereClause} ORDER BY a.${validSortBy} ${validSortOrder}`;
 
     const numericLimit = Number(limit);
@@ -613,6 +609,7 @@ async function getTestsAndCategoriesByClientAndInsurer(clientId, insurerId, sear
           AND btr.item_type = 'category'
           AND tc.is_active = 1
           AND tc.is_deleted = 0
+          AND btr.is_deleted = 0
           ${searchCondition}
         ORDER BY tc.category_name ASC
     `;

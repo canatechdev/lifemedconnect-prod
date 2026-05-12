@@ -8,6 +8,140 @@ const xlsx = require('xlsx');
 const db = require('../../lib/dbconnection');
 const logger = require('../../lib/logger');
 const { appointmentCreateSchema } = require('../../validation/v_appointments');
+
+/**
+ * Helper function to build date filter conditions
+ * Supports multiple date fields and range types
+ * @param {string} dateField - 'created_at', 'appointment_date', or 'confirmed_date'
+ * @param {string} rangeType - 'today', 'tomorrow', 'upcoming', 'custom', 'monthly', 'yearly'
+ * @param {object} dateParams - { fromDate, toDate, month, year }
+ * @returns {object} { conditions: [], params: [] }
+ */
+function buildDateFilter(dateField = 'created_at', rangeType = '', dateParams = {}) {
+    const conditions = [];
+    const params = [];
+    
+    if (!rangeType || rangeType === '') {
+        return { conditions, params };
+    }
+
+    // Use local timezone for date calculations, not UTC
+    const today = new Date();
+    const localToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const localTomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+    
+    // Format dates as YYYY-MM-DD strings in local timezone
+    const todayString = localToday.getFullYear() + '-' + 
+        String(localToday.getMonth() + 1).padStart(2, '0') + '-' + 
+        String(localToday.getDate()).padStart(2, '0');
+    const tomorrowString = localTomorrow.getFullYear() + '-' + 
+        String(localTomorrow.getMonth() + 1).padStart(2, '0') + '-' + 
+        String(localTomorrow.getDate()).padStart(2, '0');
+
+    let dateColumn = 'a.created_at';
+    
+    if (dateField === 'appointment_date') {
+        dateColumn = 'a.appointment_date';
+    } else if (dateField === 'confirmed_date') {
+        // For confirmed_date, check both confirmed_date and center/home confirmed timestamps
+        // This will be handled specially below
+    }
+
+    switch (rangeType) {
+        case 'today':
+            if (dateField === 'confirmed_date') {
+                conditions.push(`(DATE(a.confirmed_date) = DATE(?) OR DATE(a.center_confirmed_at) = DATE(?) OR DATE(a.home_confirmed_at) = DATE(?))`);
+                params.push(todayString, todayString, todayString);
+            } else {
+                // Use UTC date functions for appointment_date to avoid timezone issues
+                if (dateField === 'appointment_date') {
+                    conditions.push(`DATE(CONVERT_TZ(${dateColumn}, '+00:00', @@global.time_zone)) = DATE(?)`);
+                } else {
+                    conditions.push(`DATE(${dateColumn}) = DATE(?)`);
+                }
+                params.push(todayString);
+            }
+            break;
+
+        case 'tomorrow':
+            if (dateField === 'confirmed_date') {
+                conditions.push(`(DATE(a.confirmed_date) = DATE(?) OR DATE(a.center_confirmed_at) = DATE(?) OR DATE(a.home_confirmed_at) = DATE(?))`);
+                params.push(tomorrowString, tomorrowString, tomorrowString);
+            } else {
+                if (dateField === 'appointment_date') {
+                    conditions.push(`DATE(CONVERT_TZ(${dateColumn}, '+00:00', @@global.time_zone)) = DATE(?)`);
+                } else {
+                    conditions.push(`DATE(${dateColumn}) = DATE(?)`);
+                }
+                params.push(tomorrowString);
+            }
+            break;
+
+        case 'upcoming':
+            if (dateField === 'confirmed_date') {
+                conditions.push(`(DATE(a.confirmed_date) >= DATE(?) OR DATE(a.center_confirmed_at) >= DATE(?) OR DATE(a.home_confirmed_at) >= DATE(?))`);
+                params.push(todayString, todayString, todayString);
+            } else {
+                if (dateField === 'appointment_date') {
+                    conditions.push(`DATE(CONVERT_TZ(${dateColumn}, '+00:00', @@global.time_zone)) >= DATE(?)`);
+                } else {
+                    conditions.push(`DATE(${dateColumn}) >= DATE(?)`);
+                }
+                params.push(todayString);
+            }
+            break;
+
+        case 'custom':
+            if (dateParams.fromDate && dateParams.toDate) {
+                if (dateField === 'confirmed_date') {
+                    conditions.push(`(DATE(a.confirmed_date) BETWEEN DATE(?) AND DATE(?) OR DATE(a.center_confirmed_at) BETWEEN DATE(?) AND DATE(?) OR DATE(a.home_confirmed_at) BETWEEN DATE(?) AND DATE(?))`);
+                    params.push(dateParams.fromDate, dateParams.toDate, dateParams.fromDate, dateParams.toDate, dateParams.fromDate, dateParams.toDate);
+                } else {
+                    if (dateField === 'appointment_date') {
+                        conditions.push(`DATE(CONVERT_TZ(${dateColumn}, '+00:00', @@global.time_zone)) BETWEEN DATE(?) AND DATE(?)`);
+                    } else {
+                        conditions.push(`DATE(${dateColumn}) BETWEEN DATE(?) AND DATE(?)`);
+                    }
+                    params.push(dateParams.fromDate, dateParams.toDate);
+                }
+            }
+            break;
+
+        case 'monthly':
+            if (dateParams.month && dateParams.year) {
+                if (dateField === 'confirmed_date') {
+                    conditions.push(`(MONTH(a.confirmed_date) = ? AND YEAR(a.confirmed_date) = ?) OR (MONTH(a.center_confirmed_at) = ? AND YEAR(a.center_confirmed_at) = ?) OR (MONTH(a.home_confirmed_at) = ? AND YEAR(a.home_confirmed_at) = ?)`);
+                    params.push(parseInt(dateParams.month), parseInt(dateParams.year), parseInt(dateParams.month), parseInt(dateParams.year), parseInt(dateParams.month), parseInt(dateParams.year));
+                } else {
+                    if (dateField === 'appointment_date') {
+                        conditions.push(`(MONTH(CONVERT_TZ(${dateColumn}, '+00:00', @@global.time_zone)) = ? AND YEAR(CONVERT_TZ(${dateColumn}, '+00:00', @@global.time_zone)) = ?)`);
+                    } else {
+                        conditions.push(`(MONTH(${dateColumn}) = ? AND YEAR(${dateColumn}) = ?)`);
+                    }
+                    params.push(parseInt(dateParams.month), parseInt(dateParams.year));
+                }
+            }
+            break;
+
+        case 'yearly':
+            if (dateParams.year) {
+                if (dateField === 'confirmed_date') {
+                    conditions.push(`(YEAR(a.confirmed_date) = ? OR YEAR(a.center_confirmed_at) = ? OR YEAR(a.home_confirmed_at) = ?)`);
+                    params.push(parseInt(dateParams.year), parseInt(dateParams.year), parseInt(dateParams.year));
+                } else {
+                    if (dateField === 'appointment_date') {
+                        conditions.push(`YEAR(CONVERT_TZ(${dateColumn}, '+00:00', @@global.time_zone)) = ?`);
+                    } else {
+                        conditions.push(`YEAR(${dateColumn}) = ?`);
+                    }
+                    params.push(parseInt(dateParams.year));
+                }
+            }
+            break;
+    }
+
+    return { conditions, params };
+}
 const { createAppointment } = require('./AppointmentCRUD');
 
 // Lazy getter to avoid circular require warnings
@@ -510,20 +644,30 @@ async function getAppointmentsForExport(filters = {}) {
             status,
             medicalStatus,
             qcStatus,
-            search
+            search,
+            dateField = 'created_at',
+            rangeType = '',
+            fromDate = '',
+            toDate = '',
+            centerIds = []
         } = filters;
 
-        const conditions = ['a.is_deleted = 0'];
+        const conditions = ['a.is_deleted = 0'];  // get non deleted rows 
         const params = [];
 
-        // Month/Year filtering - check only created_at field
-        if (month && month !== '' && year && year !== '' && year !== 0) {
-            conditions.push('(MONTH(a.created_at) = ? AND YEAR(a.created_at) = ?)');
-            params.push(parseInt(month), parseInt(year));
-        } else if (year && year !== '' && year !== 0) {
-            conditions.push('YEAR(a.created_at) = ?');
-            params.push(parseInt(year));
+        // Clean Date Filtering: Only use dateField + rangeType (no legacy filters)
+        if (rangeType && rangeType !== '') {
+            const dateFilterParams = {
+                month: month || '',
+                year: year || '',
+                fromDate: fromDate || '',
+                toDate: toDate || ''
+            };
+            const dateFilter = buildDateFilter(dateField, rangeType, dateFilterParams);
+            conditions.push(...dateFilter.conditions);
+            params.push(...dateFilter.params);
         }
+        // Note: Legacy month/year filtering completely removed to avoid conflicts
 
         // Other filters
         if (customerCategory) {
@@ -549,6 +693,17 @@ async function getAppointmentsForExport(filters = {}) {
         if (qcStatus) {
             conditions.push('a.qc_status = ?');
             params.push(qcStatus);
+        }
+
+        // Diagnostic Center Filtering: Filter by center_id OR other_center_id (multiple centers support)
+        if (centerIds && centerIds.length > 0) {
+            const centerIdsInt = centerIds.map(id => parseInt(id)).filter(id => !isNaN(id));
+            if (centerIdsInt.length > 0) {
+                // Create placeholders for IN clause
+                const placeholders = centerIdsInt.map(() => '?').join(',');
+                conditions.push(`(a.center_id IN (${placeholders}) OR a.other_center_id IN (${placeholders}))`);
+                params.push(...centerIdsInt, ...centerIdsInt);
+            }
         }
 
         if (search) {

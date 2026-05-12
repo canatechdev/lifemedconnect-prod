@@ -142,6 +142,7 @@ class DashboardService {
     const where = ['is_deleted = 0'];
     const params = [];
 
+    // Center user filtering - consistent with appointments list logic
     if (user?.diagnostic_center_id) {
       where.push('(center_id = ? OR other_center_id = ?)');
       params.push(user.diagnostic_center_id, user.diagnostic_center_id);
@@ -193,25 +194,113 @@ class DashboardService {
         condition: "status = 'completed'",
         dateExpr: 'appointment_date'
       },
+      {
+        key: 'today',
+        condition: '1=1',
+        dateExpr: 'appointment_date'
+      },
+      {
+        key: 'tomorrow',
+        condition: '1=1',
+        dateExpr: 'appointment_date'
+      },
+      {
+        key: 'upcoming',
+        condition: '1=1',
+        dateExpr: 'appointment_date'
+      },
     ];
 
     const results = {};
 
     for (const bucket of buckets) {
       const dateExpr = bucket.dateExpr || 'appointment_date';
-      const sql = `
-        SELECT
-          COUNT(*) AS totalCount,
-          SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
-          SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
-        FROM appointments
-        ${baseWhere} AND ${bucket.condition}
-      `;
+      let sql, total, currentMonth, previousMonth;
+      
+      // Special handling for date-based buckets - use same logic as appointments list
+      if (['today', 'tomorrow', 'upcoming'].includes(bucket.key)) {
+        switch (bucket.key) {
+          case 'today':
+            // For appointment_date, use timezone-aware logic like appointments list
+            if (dateExpr === 'appointment_date') {
+              sql = `
+                SELECT
+                  COUNT(*) AS totalCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
+                FROM appointments
+                ${baseWhere} AND ${bucket.condition} AND DATE(CONVERT_TZ(${dateExpr}, '+00:00', @@global.time_zone)) = DATE(CURDATE())
+              `;
+            } else {
+              sql = `
+                SELECT
+                  COUNT(*) AS totalCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
+                FROM appointments
+                ${baseWhere} AND ${bucket.condition} AND DATE(${dateExpr}) = CURDATE()
+              `;
+            }
+            break;
+          case 'tomorrow':
+            if (dateExpr === 'appointment_date') {
+              sql = `
+                SELECT
+                  COUNT(*) AS totalCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
+                FROM appointments
+                ${baseWhere} AND ${bucket.condition} AND DATE(CONVERT_TZ(${dateExpr}, '+00:00', @@global.time_zone)) = DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+              `;
+            } else {
+              sql = `
+                SELECT
+                  COUNT(*) AS totalCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
+                FROM appointments
+                ${baseWhere} AND ${bucket.condition} AND DATE(${dateExpr}) = DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+              `;
+            }
+            break;
+          case 'upcoming':
+            if (dateExpr === 'appointment_date') {
+              sql = `
+                SELECT
+                  COUNT(*) AS totalCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
+                FROM appointments
+                ${baseWhere} AND ${bucket.condition} AND DATE(CONVERT_TZ(${dateExpr}, '+00:00', @@global.time_zone)) > DATE(CURDATE())
+              `;
+            } else {
+              sql = `
+                SELECT
+                  COUNT(*) AS totalCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
+                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
+                FROM appointments
+                ${baseWhere} AND ${bucket.condition} AND DATE(${dateExpr}) > CURDATE()
+              `;
+            }
+            break;
+        }
+      } else {
+        // Standard query for other buckets
+        sql = `
+          SELECT
+            COUNT(*) AS totalCount,
+            SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
+            SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
+          FROM appointments
+          ${baseWhere} AND ${bucket.condition}
+        `;
+      }
 
       const [row] = await db.query(sql, params);
-      const total = Number(row.totalCount) || 0;
-      const currentMonth = Number(row.currentMonthCount) || 0;
-      const previousMonth = Number(row.prevMonthCount) || 0;
+      total = Number(row.totalCount) || 0;
+      currentMonth = Number(row.currentMonthCount) || 0;
+      previousMonth = Number(row.prevMonthCount) || 0;
       const growth = previousMonth === 0
         ? (currentMonth > 0 ? 100 : null)
         : ((currentMonth - previousMonth) / previousMonth) * 100;
