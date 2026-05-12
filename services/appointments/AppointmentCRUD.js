@@ -519,7 +519,7 @@ async function listAppointments({ page = 1, limit = 0, search = '', sortBy = 'id
                 LEFT JOIN insurers ON appointments.insurer_id = insurers.id
                 LEFT JOIN appointment_tests at ON appointments.id = at.appointment_id
                 LEFT JOIN tests t ON at.test_id = t.id
-                LEFT JOIN test_categories tc ON t.category_id = tc.id
+                LEFT JOIN test_categories tc ON (t.category_id = tc.id OR at.category_id = tc.id)
                 ${whereClause} 
                 GROUP BY appointments.id
                 ORDER BY ${validSortBy} ${validSortOrder}`;
