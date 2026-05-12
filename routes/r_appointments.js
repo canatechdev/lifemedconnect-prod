@@ -847,8 +847,8 @@ router.get('/appointments/center/report', verifyToken, requirePermission('appoin
             month: '', // Legacy - not used in new filtering
             year: '',  // Legacy - not used in new filtering
             visitType: '',
-            status: 'completed', // Apply completed status filtering
-            medicalStatus: '',
+            status: '', // Apply completed status filtering
+            medicalStatus: 'completed', // Apply medical completed status filtering
             qcStatus: '',
             userId: req.user?.id,
             userRole: req.user?.role_id,
@@ -877,8 +877,8 @@ router.get('/appointments/center/report', verifyToken, requirePermission('appoin
             month: '', // Legacy - not used in new filtering
             year: '',  // Legacy - not used in new filtering
             visitType: '',
-            status: 'completed', // Apply completed status filtering
-            medicalStatus: '',
+            status: '', // Apply completed status filtering
+            medicalStatus: 'completed', // Apply medical completed status filtering
             qcStatus: '',
             userId: req.user?.id,
             userRole: req.user?.role_id,
