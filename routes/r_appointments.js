@@ -1409,7 +1409,8 @@ router.post('/appointments/:id/documents',
         }
 
         const docSubfolder = path.join('appointment_documents', `appointment_${appointmentId}`, `user_${req.user.id}`);
-        const filePath = await processSingleFile(req.file, docSubfolder);
+        // const filePath = await processSingleFile(req.file, docSubfolder);
+        const filePath = await processSingleFile(req.file, docSubfolder, '', true);
         const fileName = req.file.originalname;
 
         const result = await service.addDocument(
@@ -1444,7 +1445,8 @@ router.post('/appointments/:id/customer-images',
         const imageSubfolder = caseNo
             ? path.join('appointment_customer_images', caseNo)
             : path.join('appointment_customer_images', `appointment_${appointmentId}`);
-        const filePath = await processSingleFile(req.file, imageSubfolder);
+        // const filePath = await processSingleFile(req.file, imageSubfolder);
+        const filePath = await processSingleFile(req.file, imageSubfolder, '', true);
         const fileName = req.file.originalname;
 
         const result = await service.addCustomerImage(
