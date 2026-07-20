@@ -23,6 +23,7 @@ const AppointmentEmail = require('./AppointmentEmail');
 // Export all CRUD operations
 const {
     createAppointment,
+    cloneAppointment,
     listAppointments,
     getAppointment,
     getAppointmentsByIds,
@@ -121,6 +122,7 @@ const UpdateAppointmentsTechnicianDiagnosticCenters = bulkUpdateAppointments;
 module.exports = {
     // CRUD Operations
     createAppointment,
+    cloneAppointment,
     listAppointments,
     getAppointment,
     getAppointmentsByIds,

@@ -82,16 +82,11 @@ async function uploadCategorizedReports(appointmentId, reportType, filesMeta, us
  * @param {string|null} userRole - Optional: user role to determine filtering behavior
  */
 async function getCategorizedReports(appointmentId, centerId = null, userId = null, userRole = null) {
-    // DEBUG: Log function call
-    console.log('=== getCategorizedReports CALLED ===');
-    console.log('Parameters:', { appointmentId, centerId, userId, userRole });
-    
     // Get appointment details to check visit type
     const appointmentSql = 'SELECT visit_type FROM appointments WHERE id = ?';
     const appointmentRows = await db.query(appointmentSql, [appointmentId]);
     
     const visitType = appointmentRows && appointmentRows.length > 0 ? appointmentRows[0].visit_type : null;
-    console.log('Visit type detected:', visitType);
     
     // For Both appointments with centerId, filter reports by assigned_center_id
     let sqlReports = `
@@ -112,25 +107,11 @@ async function getCategorizedReports(appointmentId, centerId = null, userId = nu
 
     const params = [appointmentId];
 
-    // For "Both" visit type: Apply DC-specific filtering (only for non-admin users)
-    // DEBUG: Log values to understand what's happening
-    console.log('DC Filtering Debug:', { 
-        visitType, 
-        userId, 
-        userRole, 
-        isBoth: visitType === 'Both',
-        hasUserId: !!userId,
-        hasUserRole: !!userRole,
-        isNotAdmin: userRole !== 'Admin' && userRole !== 'Super Admin'
-    });
-    
     const shouldFilter = visitType === 'Both' && userId && userRole && userRole !== 'Admin' && userRole !== 'Super Admin' && userRole !== 'TPA';
-    console.log('Should apply DC filtering:', shouldFilter);
     
     if (shouldFilter) {
         sqlReports += ` AND acr.uploaded_by = ?`;
         params.push(userId);
-        console.log('DC Filtering Applied: Adding uploaded_by filter for user', userId);
     }
 
     // If centerId is provided, join with appointment_tests to filter by assigned_center_id
@@ -160,14 +141,15 @@ async function getCategorizedReports(appointmentId, centerId = null, userId = nu
                     (t.report_type IS NULL AND tc.report_type IS NULL)
                 )
         `;
+
+        params.length = 0;
+        params.push(appointmentId, centerId);
         
         // Add userId filtering for DC users in the second query too (only for "Both" visit type)
         if (visitType === 'Both' && userId && userRole && userRole !== 'Admin' && userRole !== 'Super Admin' && userRole !== 'TPA') {
             sqlReports += ` AND acr.uploaded_by = ?`;
             params.push(userId);
         }
-        
-        params.push(centerId);
     }
 
     sqlReports += ` ORDER BY acr.report_type, acr.uploaded_at DESC`;

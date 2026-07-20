@@ -4,7 +4,9 @@
  */
 
 const db = require('../../lib/dbconnection');
+const { generateCustomCode } = require('../../lib/generateCode');
 const logger = require('../../lib/logger');
+const { applyAdvancedFilters, getStatusConditions } = require('./AppointmentFilterHelper');
 
 
 // helper 
@@ -56,7 +58,8 @@ function parseTestsData(tests) {
 /**
  * List appointments by diagnostic center
  */
-async function listAppointmentsByCenter({ page = 1, limit = 0, search = '', centerId, listType = 'all', sortBy = 'id',sortOrder = 'DESC', customerCategory = '', month = '', year = '', visitType = '', status = '', medicalStatus = '', qcStatus = '', userId = null, userRole = null }) {
+async function listAppointmentsByCenter({ page = 1, limit = 0, search = '', centerId, listType = 'all', sortBy = 'id',sortOrder = 'DESC', customerCategory = '', month = '', year = '', visitType = '', status = '', medicalStatus = '', qcStatus = '', userId = null, userRole = null,
+    dateField = 'created_at', rangeType = '', fromDate = '', toDate = '', centerIds = [] }) {
      const allowedSortColumns = [
         'id', 'case_number', 'customer_first_name', 'customer_last_name',
         'confirmed_date', 'confirmed_time', 'medical_status'
@@ -71,70 +74,27 @@ async function listAppointmentsByCenter({ page = 1, limit = 0, search = '', cent
     ];
     searchParams.push(centerId, centerId, centerId);
 
-    // Filter by list type
-    if (listType === 'unconfirmed') {
-        conditions.push(`(a.confirmed_date IS NULL OR a.confirmed_time IS NULL)`);
-        conditions.push(`a.pushed_back = 0`);
-    } else if (listType === 'confirmed') {
-        // For "Both" visit type, check center_confirmed_at and home_confirmed_at
-        conditions.push(`(
-            (a.visit_type != 'Both' AND a.confirmed_date IS NOT NULL AND a.confirmed_time IS NOT NULL) OR
-            (a.visit_type = 'Both' AND a.center_confirmed_at IS NOT NULL AND a.home_confirmed_at IS NOT NULL)
-        )`);
-        conditions.push(`a.pushed_back = 0`);
-        conditions.push(`a.medical_status NOT IN ('completed','medical_completed')`);
-    } else if (listType === 'completed') {
-        conditions.push(`a.medical_status IN ('completed','medical_completed')`);
-        conditions.push(`(a.qc_status != 'completed' OR a.qc_status IS NULL)`);
-    }
+    // Filter by list type using centralized status conditions
+    const statusConditions = getStatusConditions(listType, 'a');
+    conditions.push(...statusConditions);
 
     if (search) {
         conditions.push(`(
-            a.case_number LIKE ? OR 
-            a.customer_first_name LIKE ? OR 
-            a.customer_last_name LIKE ? OR
+            a.case_number LIKE ? OR
             a.application_number LIKE ? OR
+            a.customer_first_name LIKE ? OR
+            a.customer_last_name LIKE ? OR
+            a.customer_mobile LIKE ? OR
+            a.customer_email LIKE ? OR
             home_center.center_name LIKE ? OR
             other_center.center_name LIKE ?
         )`);
         const like = `%${search}%`;
-        searchParams.push(like, like, like, like, like, like);
+        searchParams.push(like, like, like, like, like, like, like, like);
     }
 
-    if (customerCategory) {
-        conditions.push(`a.customer_category = ?`);
-        searchParams.push(customerCategory);
-    }
-
-    // Month/Year filtering - check only created_at field
-    if (month && month !== '' && year && year !== '' && year !== 0) {
-        conditions.push('(MONTH(a.created_at) = ? AND YEAR(a.created_at) = ?)');
-        searchParams.push(parseInt(month), parseInt(year));
-    } else if (year && year !== '' && year !== 0) {
-        conditions.push('YEAR(a.created_at) = ?');
-        searchParams.push(parseInt(year));
-    }
-
-    // Additional filters
-    if (visitType && visitType !== '') {
-        conditions.push('a.visit_type = ?');
-        searchParams.push(visitType);
-    }
-
-    if (status && status !== '') {
-        conditions.push('a.status = ?');
-        searchParams.push(status);
-    }
-
-    if (medicalStatus && medicalStatus !== '') {
-        conditions.push('(a.medical_status = ? OR a.center_medical_status = ? OR a.home_medical_status = ?)');
-        searchParams.push(medicalStatus, medicalStatus, medicalStatus);
-    }
-
-    if (qcStatus) {
-        conditions.push('a.qc_status = ?');
-        searchParams.push(qcStatus);
-    }
+    // customerCategory, month/year, visitType, status, medicalStatus, qcStatus
+    // are all applied by applyAdvancedFilters() below to keep a single source of truth.
 
     // TPA User Filtering: If user is TPA role, show only their assigned TPA's appointments
     // Check both string role name and role_id for flexibility
@@ -155,7 +115,14 @@ async function listAppointmentsByCenter({ page = 1, limit = 0, search = '', cent
 
     conditions.push(`a.is_deleted = 0`);
 
-    const whereClause = `WHERE ${conditions.join(' AND ')}`;
+    // Apply advanced filters using helper
+    const advancedFilters = { 
+        customerCategory, month, year, visitType, status, medicalStatus, qcStatus,
+        dateField, rangeType, fromDate, toDate, centerIds 
+    };
+    const { conditions: advancedConditions, params: advancedParams } = applyAdvancedFilters(conditions, searchParams, advancedFilters, 'a');
+    
+    const whereClause = `WHERE ${advancedConditions.join(' AND ')}`;
 
     const countSql = `
         SELECT COUNT(DISTINCT a.id) as total 
@@ -163,14 +130,34 @@ async function listAppointmentsByCenter({ page = 1, limit = 0, search = '', cent
         LEFT JOIN appointment_tests at ON a.id = at.appointment_id
         LEFT JOIN diagnostic_centers home_center ON a.center_id = home_center.id
         LEFT JOIN diagnostic_centers other_center ON a.other_center_id = other_center.id
+        LEFT JOIN clients ON a.client_id = clients.id
+        LEFT JOIN insurers ON a.insurer_id = insurers.id
+        LEFT JOIN tests t ON at.test_id = t.id
+        LEFT JOIN test_categories tc ON (t.category_id = tc.id OR at.category_id = tc.id)
         ${whereClause}
     `;
+
+    const countRows = await db.query(countSql, advancedParams);
+    const total = countRows[0]?.total || 0;
 
     const dataSql = `
         SELECT 
             a.*, 
             home_center.center_name as home_center_name,
             other_center.center_name as other_center_name,
+            clients.client_name as client_name,
+            clients.client_code as client_code,
+            insurers.insurer_name as insurer_name,
+            insurers.insurer_code as insurer_code,
+            (SELECT GROUP_CONCAT(DISTINCT t.test_name) 
+             FROM appointment_tests at2 
+             LEFT JOIN tests t ON at2.test_id = t.id 
+             WHERE at2.appointment_id = a.id) as test_names,
+            (SELECT GROUP_CONCAT(DISTINCT tc.category_name) 
+             FROM appointment_tests at2 
+             LEFT JOIN tests t ON at2.test_id = t.id 
+             LEFT JOIN test_categories tc ON (t.category_id = tc.id OR at2.category_id = tc.id)
+             WHERE at2.appointment_id = a.id) as category_names,
             COALESCE(
                 (SELECT 
                     JSON_ARRAYAGG(
@@ -185,10 +172,15 @@ async function listAppointmentsByCenter({ page = 1, limit = 0, search = '', cent
                             'assigned_center_id', at2.assigned_center_id,
                             'assigned_technician_id', at2.assigned_technician_id,
                             'status', at2.status,
-                            'is_completed', at2.is_completed
+                            'is_completed', at2.is_completed,
+                            'technician_name', tech_user.full_name,
+                            'technician_center', dc.center_name
                         )
                     )
                 FROM appointment_tests at2 
+                LEFT JOIN technicians tech ON at2.assigned_technician_id = tech.id
+                LEFT JOIN users tech_user ON tech.user_id = tech_user.id
+                LEFT JOIN diagnostic_centers dc ON tech.center_id = dc.id
                 WHERE at2.appointment_id = a.id
                 GROUP BY at2.appointment_id),
                 JSON_ARRAY()
@@ -197,13 +189,14 @@ async function listAppointmentsByCenter({ page = 1, limit = 0, search = '', cent
         LEFT JOIN appointment_tests at ON a.id = at.appointment_id
         LEFT JOIN diagnostic_centers home_center ON a.center_id = home_center.id
         LEFT JOIN diagnostic_centers other_center ON a.other_center_id = other_center.id
+        LEFT JOIN clients ON a.client_id = clients.id
+        LEFT JOIN insurers ON a.insurer_id = insurers.id
+        LEFT JOIN tests t ON at.test_id = t.id
+        LEFT JOIN test_categories tc ON (t.category_id = tc.id OR at.category_id = tc.id)
         ${whereClause}
         GROUP BY a.id
         ORDER BY a.${validSortBy} ${validSortOrder} 
     `;
-
-    const countRows = await db.query(countSql, searchParams);
-    const total = countRows[0]?.total || 0;
 
     const numericLimit = Number(limit);
     const numericPage = Number(page);
@@ -215,7 +208,7 @@ async function listAppointmentsByCenter({ page = 1, limit = 0, search = '', cent
     }
 
     // Apply pagination (limit/offset) via finalSql
-   let rows = await db.query(finalSql, searchParams);
+   let rows = await db.query(finalSql, advancedParams);
     rows = rows.map(row => {
         row.tests = parseTestsData(row.tests);
         return row;
@@ -242,20 +235,22 @@ async function listAppointmentsByTechnician({ page = 1, limit = 0, search = '', 
 
     if (search) {
         conditions.push(`(
-            a.case_number LIKE ? OR 
-            a.customer_first_name LIKE ? OR 
+            a.case_number LIKE ? OR
+            a.application_number LIKE ? OR
+            a.customer_first_name LIKE ? OR
             a.customer_last_name LIKE ? OR
+            a.customer_mobile LIKE ? OR
+            a.customer_email LIKE ? OR
             dc.center_name LIKE ? OR
             dc2.center_name LIKE ?
         )`);
         const like = `%${search}%`;
-        searchParams.push(like, like, like, like, like);
+        searchParams.push(like, like, like, like, like, like, like, like);
     }
 
-    if (customerCategory) {
-        conditions.push(`a.customer_category = ?`);
-        searchParams.push(customerCategory);
-    }
+    // Apply advanced filters using helper
+    const advancedFilters = { customerCategory };
+    const { conditions: advancedConditions, params: advancedParams } = applyAdvancedFilters(conditions, searchParams, advancedFilters, 'a');
 
     conditions.push(`a.is_deleted = 0`);
 
@@ -325,35 +320,49 @@ async function listAppointmentsByTechnician({ page = 1, limit = 0, search = '', 
 /**
  * List pending (pushed back) appointments - Center view
  */
-async function listCenterPendingAppointments({ page = 1, limit = 0, search = '', centerId }) {
-    // console.log(centerId,'kk')
+async function listCenterPendingAppointments({ page = 1, limit = 0, search = '', centerId, customerCategory = '',
+    month = '', year = '', visitType = '', status = '', medicalStatus = '', qcStatus = '',
+    dateField = 'created_at', rangeType = '', fromDate = '', toDate = '', centerIds = [] }) {
     const searchParams = [];
-    const conditions = [
-        'a.pushed_back = 1',
-        'a.is_deleted = 0',
-        '(a.center_id = ? OR a.other_center_id = ?)'
-    ];
+    // Use centralized status conditions for pending (pushback) appointments
+    const conditions = getStatusConditions('pending', 'a');
+    conditions.push('(a.center_id = ? OR a.other_center_id = ?)');
 
     // Push centerId twice for the OR condition
     searchParams.push(centerId, centerId);
 
     if (search) {
         conditions.push(`(
-            a.case_number LIKE ? OR 
-            a.customer_first_name LIKE ? OR 
+            a.case_number LIKE ? OR
+            a.application_number LIKE ? OR
+            a.customer_first_name LIKE ? OR
             a.customer_last_name LIKE ? OR
+            a.customer_mobile LIKE ? OR
+            a.customer_email LIKE ? OR
             dc.center_name LIKE ? OR
             dc2.center_name LIKE ?
         )`);
         const like = `%${search}%`;
-        searchParams.push(like, like, like, like, like);
+        searchParams.push(like, like, like, like, like, like, like, like);
     }
 
-    const whereClause = `WHERE ${conditions.join(' AND ')}`;
+    // customerCategory is applied by applyAdvancedFilters() below (single source of truth)
+
+    // Apply advanced filters using helper
+    // status filter excluded: pushed_back=1 is the hardcoded core condition
+    const advancedFilters = { 
+        customerCategory, month, year, visitType,
+        status: '',  // protected: this page is specifically for pushed-back appointments
+        medicalStatus, qcStatus,
+        dateField, rangeType, fromDate, toDate, centerIds 
+    };
+    const { conditions: advancedConditions, params: advancedParams } = applyAdvancedFilters(conditions, searchParams, advancedFilters, 'a');
+    
+    const whereClause = `WHERE ${advancedConditions.join(' AND ')}`;
 
     // Count total
     const countSql = `SELECT COUNT(*) as total FROM appointments a LEFT JOIN diagnostic_centers dc ON a.center_id = dc.id LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id ${whereClause}`;
-    const countRows = await db.query(countSql, searchParams);
+    const countRows = await db.query(countSql, advancedParams);
     const total = countRows[0]?.total || 0;
 
     // Fetch rows
@@ -370,7 +379,7 @@ async function listCenterPendingAppointments({ page = 1, limit = 0, search = '',
         ORDER BY a.pushed_back_at DESC
     `;
 
-    const rows = await db.query(dataSql, searchParams);
+    const rows = await db.query(dataSql, advancedParams);
 
     const numericLimit = Number(limit);
     const numericPage = Number(page);
@@ -391,32 +400,44 @@ async function listCenterPendingAppointments({ page = 1, limit = 0, search = '',
 /**
  * List pending (pushed back) appointments - Admin view
  */
-async function listPendingAppointments({ page = 1, limit = 0, search = '', customerCategory = '' }) {
+async function listPendingAppointments({ page = 1, limit = 0, search = '', customerCategory = '', 
+    month = '', year = '', visitType = '', status = '', medicalStatus = '', qcStatus = '',
+    dateField = 'created_at', rangeType = '', fromDate = '', toDate = '', centerIds = [] }) {
     const searchParams = [];
-    const conditions = ['a.pushed_back = 1', 'a.is_deleted = 0'];
+    // Use centralized status conditions for pending (pushback) appointments
+    const conditions = getStatusConditions('pending', 'a');
 
     if (search) {
         conditions.push(`(
-            a.case_number LIKE ? OR 
+            a.case_number LIKE ? OR
             a.application_number LIKE ? OR
-            a.customer_first_name LIKE ? OR 
+            a.customer_first_name LIKE ? OR
             a.customer_last_name LIKE ? OR
+            a.customer_mobile LIKE ? OR
+            a.customer_email LIKE ? OR
             dc.center_name LIKE ? OR
             dc2.center_name LIKE ?
         )`);
         const like = `%${search}%`;
-        searchParams.push(like, like, like, like, like, like);
+        searchParams.push(like, like, like, like, like, like, like, like);
     }
 
-    if (customerCategory) {
-        conditions.push(`a.customer_category = ?`);
-        searchParams.push(customerCategory);
-    }
+    // customerCategory is applied by applyAdvancedFilters() below (single source of truth)
 
-    const whereClause = `WHERE ${conditions.join(' AND ')}`;
+    // Apply advanced filters using helper
+    // status filter excluded: pushed_back=1 is the hardcoded core condition
+    const advancedFilters = { 
+        customerCategory, month, year, visitType,
+        status: '',  // protected: this page is specifically for pushed-back appointments
+        medicalStatus, qcStatus,
+        dateField, rangeType, fromDate, toDate, centerIds 
+    };
+    const { conditions: advancedConditions, params: advancedParams } = applyAdvancedFilters(conditions, searchParams, advancedFilters, 'a');
+    
+    const whereClause = `WHERE ${advancedConditions.join(' AND ')}`;
 
     const countSql = `SELECT COUNT(*) as total FROM appointments a LEFT JOIN diagnostic_centers dc ON a.center_id = dc.id LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id ${whereClause}`;
-    const countRows = await db.query(countSql, searchParams);
+    const countRows = await db.query(countSql, advancedParams);
     const total = countRows[0]?.total || 0;
 
     const dataSql = `
@@ -435,7 +456,7 @@ async function listPendingAppointments({ page = 1, limit = 0, search = '', custo
     const numericLimit = Number(limit);
     const numericPage = Number(page);
 
-    const rows = await db.query(dataSql, searchParams);
+    const rows = await db.query(dataSql, advancedParams);
 
     return {
         data: rows,
@@ -451,7 +472,9 @@ async function listPendingAppointments({ page = 1, limit = 0, search = '', custo
 /**
  * List all confirmed appointments - Admin view
  */
-async function listAllConfirmedAppointments({ page = 1, limit = 0, search = '', listType = '',sortBy = 'confirmed_date',sortOrder = 'DESC', customerCategory = '' }) {
+async function listAllConfirmedAppointments({ page = 1, limit = 0, search = '', listType = '',sortBy = 'confirmed_date',sortOrder = 'DESC', customerCategory = '',
+    month = '', year = '', visitType = '', status = '', medicalStatus = '', qcStatus = '',
+    dateField = 'created_at', rangeType = '', fromDate = '', toDate = '', centerIds = [] }) {
 
      const allowedSortColumns = [
         'confirmed_date',
@@ -468,47 +491,48 @@ async function listAllConfirmedAppointments({ page = 1, limit = 0, search = '', 
     const validSortBy = allowedSortColumns.includes(sortBy) ? sortBy : 'confirmed_date';
     const validSortOrder = sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
 
-    const conditions = [
-        // Confirmed logic: single-flow uses confirmed_date/time, both-flow uses per-side confirmations
-        `((a.visit_type != 'Both' AND a.confirmed_date IS NOT NULL AND a.confirmed_time IS NOT NULL)
-          OR (a.visit_type = 'Both' AND a.center_confirmed_at IS NOT NULL AND a.home_confirmed_at IS NOT NULL))`,
-        `a.is_deleted = 0`,
-        `(a.pushed_back = 0 OR a.status = 'qc_pushed_back')`
-
-    ];
+    // Use centralized status conditions based on listType
+    // 'completed' = medically completed appointments ready for QC
+    // '' (default) = confirmed appointments not yet medically completed
+    const statusListType = listType === 'completed' ? 'completed' : 'confirmed';
+    const conditions = getStatusConditions(statusListType, 'a');
+    conditions.push(`a.is_deleted = 0`);
 
     const searchParams = [];
 
-    if (listType === 'completed') {
-        conditions.push(`a.medical_status IN ('completed','medical_completed')`);
-        conditions.push(`(a.qc_status != 'completed' OR a.qc_status IS NULL)`);
-    } else if (listType === '') {
-        conditions.push(`a.medical_status NOT IN ('completed','medical_completed')`);
-    }
-
     if (search) {
         conditions.push(`(
-            a.case_number LIKE ? OR 
+            a.case_number LIKE ? OR
             a.application_number LIKE ? OR
-            a.customer_first_name LIKE ? OR 
+            a.customer_first_name LIKE ? OR
             a.customer_last_name LIKE ? OR
+            a.customer_mobile LIKE ? OR
+            a.customer_email LIKE ? OR
             a.medical_status LIKE ? OR
             c.center_name LIKE ? OR
             dc2.center_name LIKE ?
         )`);
         const like = `%${search}%`;
-        searchParams.push(like, like, like, like, like, like, like);
+        searchParams.push(like, like, like, like, like, like, like, like, like);
     }
 
-    if (customerCategory) {
-        conditions.push(`a.customer_category = ?`);
-        searchParams.push(customerCategory);
-    }
+    // customerCategory is applied by applyAdvancedFilters() below (single source of truth)
 
-    const whereClause = `WHERE ${conditions.join(' AND ')}`;
+    // Apply advanced filters using helper
+    // medicalStatus and qcStatus are protected - they are hardcoded per listType above
+    const advancedFilters = { 
+        customerCategory, month, year, visitType,
+        medicalStatus: '',  // protected: hardcoded by listType
+        qcStatus: '',       // protected: hardcoded by listType
+        status,
+        dateField, rangeType, fromDate, toDate, centerIds 
+    };
+    const { conditions: advancedConditions, params: advancedParams } = applyAdvancedFilters(conditions, searchParams, advancedFilters, 'a');
+    
+    const whereClause = `WHERE ${advancedConditions.join(' AND ')}`;
 
     const countSql = `SELECT COUNT(*) as total FROM appointments a LEFT JOIN diagnostic_centers c ON a.center_id = c.id LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id ${whereClause}`;
-    const countRows = await db.query(countSql, searchParams);
+    const countRows = await db.query(countSql, advancedParams);
     const total = countRows[0]?.total || 0;
 
     const dataSql = `SELECT a.*, c.center_name as home_center_name, dc2.center_name as other_center_name, cl.client_name FROM appointments a LEFT JOIN diagnostic_centers c ON a.center_id = c.id LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id LEFT JOIN clients cl ON a.client_id = cl.id ${whereClause} ORDER BY a.${validSortBy} ${validSortOrder}`;
@@ -519,14 +543,9 @@ async function listAllConfirmedAppointments({ page = 1, limit = 0, search = '', 
 
     let rows;
     if (numericLimit > 0) {
-        // const limitParam = Number(numericLimit);
-        // const offsetParam = Number(offset);
-        // Build SQL with LIMIT and OFFSET as literals to avoid parameter binding issues
-        // const sqlWithLimit = `${dataSql} LIMIT ${limitParam} OFFSET ${offsetParam}`;
-        // rows = await db.query(sqlWithLimit, searchParams);
-        rows = await db.query(`${dataSql} LIMIT ${numericLimit} OFFSET ${offset}`, searchParams);
+        rows = await db.query(`${dataSql} LIMIT ${numericLimit} OFFSET ${offset}`, advancedParams);
     } else {
-        rows = await db.query(dataSql, searchParams);
+        rows = await db.query(dataSql, advancedParams);
     }
 
     return {

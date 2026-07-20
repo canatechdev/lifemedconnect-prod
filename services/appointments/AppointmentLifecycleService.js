@@ -33,6 +33,10 @@ class AppointmentLifecycleService {
       }
 
       // First, find the appointment with client filtering
+      const searchValue = String(searchTerm).trim();
+      const normalizedSearch = searchValue.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const isPureNumericId = /^\d+$/.test(searchValue);
+
       const appointmentSql = `
         SELECT 
           a.*,
@@ -71,17 +75,63 @@ class AppointmentLifecycleService {
         LEFT JOIN users updater ON a.updated_by = updater.id
         WHERE a.is_deleted = 0
           AND (
-            a.case_number = ? 
-            OR a.application_number = ? 
-            OR a.id = ?
+            ${isPureNumericId ? 'a.id = ? OR' : ''}
+            LOWER(a.case_number) = ? OR
+            LOWER(a.application_number) = ? OR
+            LOWER(REPLACE(REPLACE(REPLACE(a.case_number, '/', ''), '-', ''), ' ', '')) = ? OR
+            LOWER(REPLACE(REPLACE(REPLACE(a.application_number, '/', ''), '-', ''), ' ', '')) = ? OR
+            LOWER(a.case_number) LIKE ? OR
+            LOWER(a.application_number) LIKE ? OR
+            LOWER(REPLACE(REPLACE(REPLACE(a.case_number, '/', ''), '-', ''), ' ', '')) LIKE ? OR
+            LOWER(REPLACE(REPLACE(REPLACE(a.application_number, '/', ''), '-', ''), ' ', '')) LIKE ?
           )
           ${linkedClientId ? 'AND a.client_id = ?' : ''}
+        ORDER BY
+          CASE
+            WHEN LOWER(a.case_number) = ? THEN 1
+            WHEN LOWER(a.application_number) = ? THEN 2
+            WHEN LOWER(REPLACE(REPLACE(REPLACE(a.case_number, '/', ''), '-', ''), ' ', '')) = ? THEN 3
+            WHEN LOWER(REPLACE(REPLACE(REPLACE(a.application_number, '/', ''), '-', ''), ' ', '')) = ? THEN 4
+            WHEN LOWER(a.case_number) LIKE ? THEN 5
+            WHEN LOWER(a.application_number) LIKE ? THEN 6
+            WHEN LOWER(REPLACE(REPLACE(REPLACE(a.case_number, '/', ''), '-', ''), ' ', '')) LIKE ? THEN 7
+            WHEN LOWER(REPLACE(REPLACE(REPLACE(a.application_number, '/', ''), '-', ''), ' ', '')) LIKE ? THEN 8
+            ${isPureNumericId ? 'WHEN a.id = ? THEN 0' : ''}
+            ELSE 99
+          END
         LIMIT 1
       `;
 
-      const searchParams = [searchTerm, searchTerm, searchTerm];
+      const lowerSearchValue = searchValue.toLowerCase();
+      const searchParams = [];
+      if (isPureNumericId) {
+        searchParams.push(Number(searchValue));
+      }
+      searchParams.push(
+        lowerSearchValue,
+        lowerSearchValue,
+        normalizedSearch,
+        normalizedSearch,
+        `%${lowerSearchValue}%`,
+        `%${lowerSearchValue}%`,
+        `%${normalizedSearch}%`,
+        `%${normalizedSearch}%`
+      );
       if (linkedClientId) {
         searchParams.push(linkedClientId);
+      }
+      searchParams.push(
+        lowerSearchValue,
+        lowerSearchValue,
+        normalizedSearch,
+        normalizedSearch,
+        `%${lowerSearchValue}%`,
+        `%${lowerSearchValue}%`,
+        `%${normalizedSearch}%`,
+        `%${normalizedSearch}%`
+      );
+      if (isPureNumericId) {
+        searchParams.push(Number(searchValue));
       }
 
       const appointments = await db.query(appointmentSql, searchParams);
@@ -170,7 +220,9 @@ class AppointmentLifecycleService {
           at.item_name,
           t.test_name,
           t.test_code,
+          t.report_type as test_report_type,
           tc.category_name,
+          tc.report_type as category_report_type,
           tech.full_name as technician_full_name,
           tech.technician_code as technician_code,
           tech.mobile as technician_mobile,
@@ -218,7 +270,7 @@ class AppointmentLifecycleService {
       const timeline = this._buildTimeline(history, qcHistory, appointment);
 
       // Calculate metrics
-      const metrics = this._calculateMetrics(appointment, history, qcHistory);
+      const metrics = this._calculateMetrics(appointment, history, qcHistory, timeline);
 
       // Add PDF download options
       appointment.pdf_downloads = {
@@ -290,6 +342,24 @@ class AppointmentLifecycleService {
    */
   _buildTimeline(history, qcHistory, appointment) {
     const events = [];
+    const consumedQcIds = new Set();
+    const qcActionForHistory = {
+      qc_submit: 'submitted_for_qc',
+      qc_partial_save: 'partial_save',
+      qc_complete: 'completed',
+      qc_push_back: 'pushed_back'
+    };
+    const toTime = (value) => new Date(value).getTime();
+    const findMatchingQc = (historyRow) => {
+      const action = qcActionForHistory[historyRow.change_type];
+      if (!action) return null;
+      const historyTime = toTime(historyRow.created_at);
+      return qcHistory.find((qc) => (
+        !consumedQcIds.has(qc.id) &&
+        qc.action === action &&
+        Math.abs(toTime(qc.created_at) - historyTime) <= 2000
+      )) || null;
+    };
 
     // Add creation event
     events.push({
@@ -298,6 +368,7 @@ class AppointmentLifecycleService {
       title: 'Appointment Created',
       description: `Case ${appointment.case_number} created`,
       icon: 'create',
+      user: appointment.created_by_name || appointment.updated_by_name || null,
       metadata: {
         visit_type: appointment.visit_type,
         customer_category: appointment.customer_category
@@ -306,6 +377,12 @@ class AppointmentLifecycleService {
 
     // Add history events
     history.forEach(h => {
+      const matchedQc = findMatchingQc(h);
+      const parsedMetadata = this._parseMetadata(h.metadata);
+      if (matchedQc) {
+        consumedQcIds.add(matchedQc.id);
+      }
+
       const event = {
         type: 'status_change',
         timestamp: h.created_at,
@@ -314,18 +391,28 @@ class AppointmentLifecycleService {
         description: this._getHistoryDescription(h),
         icon: this._getHistoryIcon(h.change_type),
         user: h.changed_by_name,
-        metadata: h.metadata ? (typeof h.metadata === 'string' ? JSON.parse(h.metadata) : h.metadata) : {},
+        metadata: matchedQc ? {
+          ...parsedMetadata,
+          pathology_checked: matchedQc.pathology_checked,
+          cardiology_checked: matchedQc.cardiology_checked,
+          sonography_checked: matchedQc.sonography_checked,
+          mer_checked: matchedQc.mer_checked,
+          mtrf_checked: matchedQc.mtrf_checked,
+          radiology_checked: matchedQc.radiology_checked,
+          other_checked: matchedQc.other_checked
+        } : parsedMetadata,
         old_status: h.old_status,
         new_status: h.new_status,
         old_medical_status: h.old_medical_status,
         new_medical_status: h.new_medical_status,
-        remarks: h.remarks
+        remarks: h.remarks || matchedQc?.remarks || null
       };
       events.push(event);
     });
 
     // Add QC events
     qcHistory.forEach(qc => {
+      if (consumedQcIds.has(qc.id)) return;
       const event = {
         type: 'qc_action',
         timestamp: qc.created_at,
@@ -351,7 +438,44 @@ class AppointmentLifecycleService {
     // Sort by timestamp
     events.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 
-    return events;
+    return this._dedupeTimeline(events);
+  }
+
+  _dedupeTimeline(events) {
+    const seen = new Set();
+    return events.filter((event) => {
+      if (event.type === 'creation') return true;
+      const noRemarks = !event.remarks;
+      const duplicateKey = [
+        event.type,
+        event.change_type || event.action || '',
+        event.old_status || '',
+        event.new_status || '',
+        event.old_medical_status || '',
+        event.new_medical_status || ''
+      ].join('|');
+
+      if (noRemarks && seen.has(duplicateKey)) {
+        return false;
+      }
+
+      if (noRemarks) {
+        seen.add(duplicateKey);
+      }
+
+      return true;
+    });
+  }
+
+  _parseMetadata(metadata) {
+    if (!metadata) return {};
+    if (typeof metadata !== 'string') return metadata;
+    try {
+      return JSON.parse(metadata);
+    } catch (error) {
+      logger.warn('Invalid appointment history metadata JSON', { error: error.message });
+      return {};
+    }
   }
 
   /**
@@ -465,9 +589,9 @@ class AppointmentLifecycleService {
    * Calculate metrics for the appointment
    * @private
    */
-  _calculateMetrics(appointment, history, qcHistory) {
+  _calculateMetrics(appointment, history, qcHistory, timeline = null) {
     const metrics = {
-      total_events: history.length + qcHistory.length,
+      total_events: Array.isArray(timeline) ? timeline.length : history.length + qcHistory.length,
       status_changes: history.filter(h => h.old_status !== h.new_status).length,
       medical_status_changes: history.filter(h => h.old_medical_status !== h.new_medical_status).length,
       qc_submissions: qcHistory.filter(q => q.action === 'submitted_for_qc').length,

@@ -60,7 +60,8 @@ const getUserByUsername = async (username) => {
             t.technician_type,
             t.rate_per_appointment,
             t.profile_pic,
-            dc.id AS diagnostic_center_id
+            dc.id AS diagnostic_center_id,
+            dc.center_name
         FROM users u
         LEFT JOIN technicians t ON u.id = t.user_id AND t.is_deleted = 0
         LEFT JOIN diagnostic_centers dc ON u.id = dc.user_id AND dc.is_deleted = 0

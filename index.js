@@ -184,6 +184,8 @@ const rbacRoutes = require('./routes/r_rbac');
 const telephonyRoutes = require('./routes/r_telephony');
 const smartReportRoutes = require('./routes/r_smart_reports');
 const appointmentLifecycleRoutes = require('./routes/r_appointment_lifecycle');
+const tpaRoutes = require('./routes/r_tpa');
+const tpaManagementRoutes = require('./routes/r_tpa_management');
 
 // Health check route
 app.get('/', (req, res) => {
@@ -220,6 +222,14 @@ app.get('/api/health', async (req, res) => {
     }
 });
 
+// Register TPA routes BEFORE CSRF protection (TPA uses API key auth)
+app.use('/api/tpa', tpaRoutes);
+
+// App (mobile) routes (no CSRF) - register BEFORE CSRF protection
+app.use('/api/app', appAuthRoutes);
+app.use('/api/app', appAppointmentRoutes);
+app.use('/api/app', appDashboardRoutes);
+
 //  Apply CSRF protection to state-changing routes
 // Note: GET requests don't need CSRF, only POST/PUT/DELETE/PATCH
 app.use('/api/', conditionalCsrfProtection);
@@ -244,10 +254,8 @@ app.use('/api', rbacRoutes);
 app.use('/api/telephony', telephonyRoutes);
 app.use('/api/smart-reports', smartReportRoutes);
 app.use('/api/appointment-lifecycle', appointmentLifecycleRoutes);
-// App (mobile) routes (no CSRF)
-app.use('/api/app', appAuthRoutes);
-app.use('/api/app', appAppointmentRoutes);
-app.use('/api/app', appDashboardRoutes);
+app.use('/api/tpa', tpaRoutes);
+app.use('/api/tpa-management', tpaManagementRoutes);
 
 // SPA Fallback: Serve index.html for all non-API routes (production only)
 // This allows React Router to handle client-side routing

@@ -7,6 +7,7 @@
 const WebSocket = require('ws');
 const logger = require('../../lib/logger');
 const { query } = require('../../lib/dbconnection');
+const { TPAWebhookService } = require('../tpa');
 
 class SparkTGSocketService {
     constructor() {
@@ -297,15 +298,19 @@ class SparkTGSocketService {
                 payload.status = 'ended';
                 payload.message = 'Customer disconnected';
                 payload.hangupBy = 'customer';
+                // Trigger webhook BEFORE removing from ongoing_calls
+                await this.triggerTPAWebhook(eventType, callId, payload);
                 await this.removeOngoingCall(callId);
-                break;
+                return; // Skip webhook trigger at the end since we already triggered it
 
             case 'AgentHangup':
                 payload.status = 'ended';
                 payload.message = 'Agent disconnected';
                 payload.hangupBy = 'agent';
+                // Trigger webhook BEFORE removing from ongoing_calls
+                await this.triggerTPAWebhook(eventType, callId, payload);
                 await this.removeOngoingCall(callId);
-                break;
+                return; // Skip webhook trigger at the end since we already triggered it
 
             case 'HoldUnhold':
                 const holdData = event.data;
@@ -367,6 +372,9 @@ class SparkTGSocketService {
         }
 
         logger.info('Call event broadcasted successfully', { eventType, callId, status: payload.status });
+
+        // Trigger TPA webhook for key call events
+        await this.triggerTPAWebhook(eventType, callId, payload);
     }
 
     /**
@@ -391,6 +399,111 @@ class SparkTGSocketService {
             await query('DELETE FROM ongoing_calls WHERE call_id = ?', [callId]);
         } catch (error) {
             logger.error('Failed to remove ongoing call', { error: error.message, callId });
+        }
+    }
+
+    /**
+     * Trigger TPA webhook for call events
+     */
+    async triggerTPAWebhook(eventType, callId, payload) {
+        try {
+            // Only trigger webhooks for key events
+            const webhookEvents = ['CustomerUp', 'AgentUp', 'CustomerHangup', 'AgentHangup', 'CallDetails'];
+            if (!webhookEvents.includes(eventType)) {
+                return;
+            }
+
+            // Get appointment details from ongoing_calls
+            const ongoingCall = await query(
+                'SELECT appointment_id, center_id FROM ongoing_calls WHERE call_id = ? LIMIT 1',
+                [callId]
+            );
+
+            if (!ongoingCall || ongoingCall.length === 0) {
+                logger.info('No ongoing call found for webhook', { callId, eventType });
+                return;
+            }
+
+            const appointmentId = ongoingCall[0].appointment_id;
+            
+            // Get full appointment details
+            const appointment = await query(
+                `SELECT a.*, c.client_name 
+                 FROM appointments a 
+                 LEFT JOIN clients c ON a.client_id = c.id 
+                 WHERE a.id = ?`,
+                [appointmentId]
+            );
+
+            if (!appointment || appointment.length === 0) {
+                logger.warn('Appointment not found for webhook', { appointmentId, callId });
+                return;
+            }
+
+            const apt = appointment[0];
+
+            // Only trigger webhooks for CD TPA appointments
+            if (apt.client_id !== 24) {
+                logger.info('Skipping webhook - not CD TPA appointment', { 
+                    appointmentId, 
+                    clientId: apt.client_id, 
+                    clientName: apt.client_name 
+                });
+                return;
+            }
+
+            // Map call events to webhook event types
+            const eventMap = {
+                'CustomerUp': 'call_started',
+                'AgentUp': 'call_connected',
+                'CustomerHangup': 'call_ended',
+                'AgentHangup': 'call_ended',
+                'CallDetails': 'call_completed'
+            };
+
+            const webhookEventType = eventMap[eventType];
+            if (!webhookEventType) {
+                return;
+            }
+
+            // Build webhook payload
+            const webhookPayload = {
+                case_number: apt.case_number,
+                application_number: apt.application_number || '',
+                data: {
+                    patient_name: `${apt.customer_first_name} ${apt.customer_last_name || ''}`.trim(),
+                    patient_phone: apt.customer_mobile,
+                    patient_email: apt.customer_email,
+                    appointment_date: apt.appointment_date,
+                    appointment_time: apt.appointment_time,
+                    call_id: callId,
+                    call_event: eventType,
+                    call_status: payload.status,
+                    call_type: payload.callType,
+                    agent_id: payload.agentId,
+                    customer_number: payload.customerNumber,
+                    timestamp: new Date().toISOString(),
+                    hangup_by: payload.hangupBy || null
+                }
+            };
+
+            // Trigger webhook
+            await TPAWebhookService.sendWebhook(apt.client_id, webhookEventType, webhookPayload);
+            
+            logger.info('TPA webhook triggered for call event', {
+                appointmentId,
+                callId,
+                eventType,
+                webhookEventType,
+                case_number: apt.case_number
+            });
+
+        } catch (error) {
+            logger.error('Failed to trigger TPA webhook for call event', {
+                callId,
+                eventType,
+                error: error.message
+            });
         }
     }
 

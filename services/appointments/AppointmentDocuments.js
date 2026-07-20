@@ -6,6 +6,39 @@
 const db = require('../../lib/dbconnection');
 const logger = require('../../lib/logger');
 
+function normalizeText(value) {
+    return String(value || '').trim().toLowerCase();
+}
+
+async function documentExists(appointmentId, docType, docNumber, fileName) {
+    const rows = await db.query(
+        `SELECT id
+         FROM appointment_documents
+         WHERE appointment_id = ?
+           AND is_deleted = 0
+           AND LOWER(TRIM(doc_type)) = ?
+           AND LOWER(TRIM(COALESCE(doc_number, ''))) = ?
+           AND LOWER(TRIM(file_name)) = ?
+         LIMIT 1`,
+        [appointmentId, normalizeText(docType), normalizeText(docNumber), normalizeText(fileName)]
+    );
+    return rows[0] || null;
+}
+
+async function customerImageExists(appointmentId, imageLabel, fileName) {
+    const rows = await db.query(
+        `SELECT id
+         FROM appointment_customer_images
+         WHERE appointment_id = ?
+           AND is_deleted = 0
+           AND LOWER(TRIM(image_label)) = ?
+           AND LOWER(TRIM(file_name)) = ?
+         LIMIT 1`,
+        [appointmentId, normalizeText(imageLabel), normalizeText(fileName)]
+    );
+    return rows[0] || null;
+}
+
 /**
  * Add a customer document
  * @param {number} appointmentId 
@@ -20,6 +53,17 @@ async function addDocument(appointmentId, docType, docNumber, filePath, fileName
     // if (!validTypes.includes(docType)) {
     //     throw new Error(`Invalid document type: ${docType}`);
     // }
+
+    const existing = await documentExists(appointmentId, docType, docNumber, fileName);
+    if (existing) {
+        logger.info('Duplicate document skipped', { appointmentId, docType, userId, existingDocumentId: existing.id });
+        return {
+            success: true,
+            message: 'Document already exists',
+            documentId: existing.id,
+            skipped: true
+        };
+    }
 
     const sql = `
         INSERT INTO appointment_documents 
@@ -99,8 +143,17 @@ async function getDocuments(appointmentId) {
  * @param {number} userId 
  */
 async function addCustomerImage(appointmentId, imageLabel, filePath, fileName, userId) {
-    if (!imageLabel || imageLabel.trim() === '') {
-        throw new Error('Image label is required');
+    const safeImageLabel = String(imageLabel || '').trim();
+
+    const existing = await customerImageExists(appointmentId, safeImageLabel, fileName);
+    if (existing) {
+        logger.info('Duplicate customer image skipped', { appointmentId, imageLabel: safeImageLabel, userId, existingImageId: existing.id });
+        return {
+            success: true,
+            message: 'Customer image already exists',
+            imageId: existing.id,
+            skipped: true
+        };
     }
 
     const sql = `
@@ -111,13 +164,13 @@ async function addCustomerImage(appointmentId, imageLabel, filePath, fileName, u
 
     const result = await db.query(sql, [
         appointmentId,
-        imageLabel.trim(),
+        safeImageLabel,
         filePath,
         fileName,
         userId
     ]);
 
-    logger.info('Customer image added', { appointmentId, imageLabel, userId });
+    logger.info('Customer image added', { appointmentId, imageLabel: safeImageLabel, userId });
     return { 
         success: true, 
         message: 'Customer image added successfully',
@@ -244,15 +297,16 @@ async function batchAddDocumentsAndImages(appointmentId, documents, images, user
             `;
 
             for (const img of images) {
-                if (img.imageLabel && img.imageLabel.trim() !== '') {
+                if (img.filePath) {
+                    const imageLabel = String(img.imageLabel || '').trim();
                     const result = await connection.query(imgSql, [
                         appointmentId,
-                        img.imageLabel.trim(),
+                        imageLabel,
                         img.filePath,
                         img.fileName,
                         userId
                     ]);
-                    results.images.push({ id: result.insertId, ...img });
+                    results.images.push({ id: result.insertId, ...img, imageLabel });
                 }
             }
         }
@@ -281,9 +335,11 @@ async function batchAddDocumentsAndImages(appointmentId, documents, images, user
 
 module.exports = {
     addDocument,
+    documentExists,
     deleteDocument,
     getDocuments,
     addCustomerImage,
+    customerImageExists,
     deleteCustomerImage,
     getCustomerImages,
     updateImageLabel,

@@ -8,6 +8,7 @@ const xlsx = require('xlsx');
 const db = require('../../lib/dbconnection');
 const logger = require('../../lib/logger');
 const { appointmentCreateSchema } = require('../../validation/v_appointments');
+const { getExportRemarksByAppointmentIds } = require('./AppointmentExportRemarks');
 
 /**
  * Helper function to build date filter conditions
@@ -634,7 +635,7 @@ async function processUploadedFile(filePath, user) {
  * Get all appointments for export (no pagination)
  * Supports comprehensive filtering including month/year
  */
-async function getAppointmentsForExport(filters = {}) {
+async function getAppointmentsForExport(filters = {}, user = null) {
     try {
         const {
             month,
@@ -654,6 +655,28 @@ async function getAppointmentsForExport(filters = {}) {
 
         const conditions = ['a.is_deleted = 0'];  // get non deleted rows 
         const params = [];
+
+        if (user?.diagnostic_center_id) {
+            conditions.push('(a.center_id = ? OR a.other_center_id = ?)');
+            params.push(user.diagnostic_center_id, user.diagnostic_center_id);
+        }
+        if (user?.insurer_id) {
+            conditions.push('a.insurer_id = ?');
+            params.push(user.insurer_id);
+        }
+        if (user?.client_id) {
+            conditions.push('a.client_id = ?');
+            params.push(user.client_id);
+        }
+        if (user?.technician_id || user?.assigned_technician_id) {
+            const technicianId = user.technician_id || user.assigned_technician_id;
+            conditions.push(`EXISTS (
+                SELECT 1 FROM appointment_tests scope_at
+                WHERE scope_at.appointment_id = a.id
+                  AND scope_at.assigned_technician_id = ?
+            )`);
+            params.push(technicianId);
+        }
 
         // Clean Date Filtering: Only use dateField + rangeType (no legacy filters)
         if (rangeType && rangeType !== '') {
@@ -809,11 +832,12 @@ async function generateExportExcel(appointments, filters = {}) {
     try {
         const workbook = new ExcelJS.Workbook();
         const worksheet = workbook.addWorksheet('Appointments Export');
+        const exportRemarks = await getExportRemarksByAppointmentIds(appointments.map((apt) => apt.id));
 
         // Add filter info header
         let currentRow = 1;
         worksheet.getRow(currentRow).values = ['APPOINTMENTS EXPORT'];
-        worksheet.mergeCells(`A${currentRow}:Z${currentRow}`);
+        worksheet.mergeCells(`A${currentRow}:AL${currentRow}`);
         worksheet.getCell(`A${currentRow}`).font = { bold: true, size: 16 };
         worksheet.getCell(`A${currentRow}`).alignment = { horizontal: 'center' };
         currentRow++;
@@ -847,7 +871,7 @@ async function generateExportExcel(appointments, filters = {}) {
             'Confirmed Time', 'Status', 'Medical Status', 'QC Status',
             'Cost Type', 'Amount',
             'Test Count', 'Categories', 'Tests', 'Assigned Technicians',
-            'Remarks', 'Medical Remarks',
+            'Remarks', 'Medical Remarks', 'All Remarks',
             'Created At'
         ];
 
@@ -904,6 +928,7 @@ async function generateExportExcel(appointments, filters = {}) {
                 apt.technicians_info || '',
                 apt.remarks,
                 apt.medical_remarks,
+                exportRemarks.get(Number(apt.id)) || '',
                 apt.created_at ? new Date(apt.created_at).toLocaleString('en-IN') : ''
             ];
         });
@@ -928,6 +953,8 @@ async function generateExportExcel(appointments, filters = {}) {
                 column.width = Math.min(maxLength + 5, 50);
             } else if (columnName === 'Test Count') {
                 column.width = 15; // Fixed width for count
+            } else if (columnName === 'All Remarks') {
+                column.width = 60;
             } else {
                 column.width = Math.min(maxLength + 2, 50);
             }

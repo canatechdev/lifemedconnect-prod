@@ -7,22 +7,21 @@ const Joi = require('joi');
 // Add document
 const addDocumentSchema = Joi.object({
     docType: Joi.string()
-        .valid('aadhaar', 'pan', 'driving_license', 'voter_id', 'passport','student_id','other_id')
+        .trim()
+        .max(100)
         .required()
         .messages({
             'any.required': 'Document type is required',
-            'any.only': 'Invalid document type'
+            'string.empty': 'Document type is required',
+            'string.max': 'Document type must not exceed 100 characters'
         }),
     docNumber: Joi.string()
-        .required()
-        .min(1)
+        .allow('', null)
         .max(50)
         .messages({
-            'any.required': 'Document number is required',
-            'string.min': 'Document number is required',
             'string.max': 'Document number must not exceed 50 characters'
         })
-});
+}).unknown(true);
 
 // Delete document
 const deleteDocumentSchema = Joi.object({
@@ -38,15 +37,12 @@ const deleteDocumentSchema = Joi.object({
 // Add customer image
 const addCustomerImageSchema = Joi.object({
     imageLabel: Joi.string()
-        .required()
-        .min(1)
+        .allow('', null)
         .max(100)
         .messages({
-            'any.required': 'Image label is required',
-            'string.min': 'Image label is required',
             'string.max': 'Image label must not exceed 100 characters'
         })
-});
+}).unknown(true);
 
 // Delete customer image
 const deleteCustomerImageSchema = Joi.object({

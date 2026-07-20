@@ -6,12 +6,15 @@
 const db = require('../../lib/dbconnection');
 const logger = require('../../lib/logger');
 const { formatTimeAMPM, formatDateDDMMYYYY } = require('../approvals/utils/normalizers');
+const { applyAdvancedFilters, getStatusConditions } = require('./AppointmentFilterHelper');
 
 /**
  * List appointments pending QC
  * WHERE qc_status = 'pending' OR qc_status = 'in_process'
  */
-async function listQCPendingAppointments({ page = 1, limit = 10, search = '', sortBy = 'id', sortOrder = 'DESC', customerCategory = '' }) {
+async function listQCPendingAppointments({ page = 1, limit = 10, search = '', sortBy = 'id', sortOrder = 'DESC', customerCategory = '',
+    month = '', year = '', visitType = '', status = '', medicalStatus = '', qcStatus = '',
+    dateField = 'created_at', rangeType = '', fromDate = '', toDate = '', centerIds = [], emailSent = '' }) {
     const allowedSortColumns = [
         'id', 'case_number', 'customer_first_name', 'customer_last_name',
         'confirmed_date', 'qc_status'
@@ -20,33 +23,49 @@ async function listQCPendingAppointments({ page = 1, limit = 10, search = '', so
     const validSortOrder = sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
 
     const searchParams = [];
-    const conditions = [
-        `a.is_deleted = 0`,
-        `(a.qc_status = 'pending' OR a.qc_status = 'in_process' OR a.qc_status = 'completed' OR a.qc_status = 'pushed_back')`
-    ];
+    // Use centralized status conditions for QC pending (medically completed) appointments
+    const conditions = getStatusConditions('qc_pending', 'a');
+    conditions.push(`a.is_deleted = 0`);
 
     if (search) {
         conditions.push(`(
-            a.case_number LIKE ? OR 
-            a.customer_first_name LIKE ? OR 
-            a.customer_last_name LIKE ? OR
+            a.case_number LIKE ? OR
             a.application_number LIKE ? OR
+            a.customer_first_name LIKE ? OR
+            a.customer_last_name LIKE ? OR
+            a.customer_mobile LIKE ? OR
+            a.customer_email LIKE ? OR
             dc.center_name LIKE ? OR
             dc2.center_name LIKE ?
         )`);
         const like = `%${search}%`;
-        searchParams.push(like, like, like, like, like, like);
+        searchParams.push(like, like, like, like, like, like, like, like);
     }
 
-    if (customerCategory) {
-        conditions.push(`a.customer_category = ?`);
-        searchParams.push(customerCategory);
+    // customerCategory is applied by applyAdvancedFilters() below (single source of truth)
+
+    // Email sent filter
+    if (emailSent === 'pending') {
+        conditions.push(`NOT EXISTS (SELECT 1 FROM tpa_email_log tel WHERE tel.appointment_id = a.id)`);
+    } else if (emailSent === 'sent') {
+        conditions.push(`EXISTS (SELECT 1 FROM tpa_email_log tel WHERE tel.appointment_id = a.id)`);
     }
 
-    const whereClause = `WHERE ${conditions.join(' AND ')}`;
+    // Apply advanced filters using helper
+    // medicalStatus is protected (hardcoded to medical completed)
+    // qcStatus filter is allowed to filter within all qc statuses
+    const advancedFilters = { 
+        customerCategory, month, year, visitType, status,
+        medicalStatus: '',  // protected: QC page only shows medical completed
+        qcStatus,           // allowed: filters within all qc statuses
+        dateField, rangeType, fromDate, toDate, centerIds 
+    };
+    const { conditions: advancedConditions, params: advancedParams } = applyAdvancedFilters(conditions, searchParams, advancedFilters, 'a');
+
+    const whereClause = `WHERE ${advancedConditions.join(' AND ')}`;
 
     const countSql = `
-        SELECT COUNT(*) as total 
+        SELECT COUNT(*) as total
         FROM appointments a
         LEFT JOIN diagnostic_centers dc ON a.center_id = dc.id
         LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id
@@ -104,7 +123,7 @@ async function listQCPendingAppointments({ page = 1, limit = 10, search = '', so
         ORDER BY a.${validSortBy} ${validSortOrder}
     `;
 
-    const countRows = await db.query(countSql, searchParams);
+    const countRows = await db.query(countSql, advancedParams);
     const total = countRows[0]?.total || 0;
 
     const numericLimit = Number(limit);
@@ -116,7 +135,7 @@ async function listQCPendingAppointments({ page = 1, limit = 10, search = '', so
         finalSql += ` LIMIT ${numericLimit} OFFSET ${offset}`;
     }
 
-    let rows = await db.query(finalSql, searchParams);
+    let rows = await db.query(finalSql, advancedParams);
 
     // Parse tests and tpa_emails data
     rows = rows.map(row => {
@@ -246,6 +265,16 @@ async function pushBackToReports(appointmentId, remarks, userId, centerId = null
         const currentRow = Array.isArray(current) ? current[0] : current;
         const visitType = currentRow.visit_type;
 
+        // Fetch the latest QC history to preserve current checkbox states.
+        const [latestHistory] = await connection.query(`
+            SELECT * FROM appointment_qc_history 
+            WHERE appointment_id = ? 
+            ORDER BY created_at DESC 
+            LIMIT 1
+        `, [appointmentId]);
+
+        const previousCheckboxes = latestHistory && latestHistory.length > 0 ? latestHistory[0] : {};
+
         // For "Both" visit type with centerId, implement center-specific pushback
         if (visitType === 'Both' && centerId) {
             // Delete only reports from this specific center
@@ -264,7 +293,7 @@ async function pushBackToReports(appointmentId, remarks, userId, centerId = null
                 INSERT INTO appointment_qc_history 
                 (appointment_id, action, remarks, qc_by, created_at, 
                  pathology_checked, cardiology_checked, radiology_checked, mer_checked, mtrf_checked, other_checked)
-                VALUES (?, 'center_pushback', ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
+                VALUES (?, 'pushed_back', ?, ?, NOW(), ?, ?, ?, ?, ?, ?)
             `, [
                 appointmentId,
                 `Center-specific pushback: ${remarks}`,
@@ -282,16 +311,6 @@ async function pushBackToReports(appointmentId, remarks, userId, centerId = null
             logger.info('Center-specific QC pushback completed', { appointmentId, centerId, userId });
             return { success: true, message: 'Center-specific reports pushed back successfully' };
         }
-
-        // Fetch the LATEST QC history to get current checkbox states
-        const [latestHistory] = await connection.query(`
-            SELECT * FROM appointment_qc_history 
-            WHERE appointment_id = ? 
-            ORDER BY created_at DESC 
-            LIMIT 1
-        `, [appointmentId]);
-
-        const previousCheckboxes = latestHistory && latestHistory.length > 0 ? latestHistory[0] : {};
 
         // Update appointment: qc_status = 'pushed_back', status = 'pushed_back', pushed_back = 1
         await connection.query(`

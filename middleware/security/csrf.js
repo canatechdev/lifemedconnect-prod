@@ -73,6 +73,10 @@ const csrfErrorHandler = (err, req, res, next) => {
  * Conditional CSRF protection
  * Only applies to state-changing methods (POST, PUT, DELETE, PATCH)
  * GET requests don't need CSRF protection
+ * 
+ * Environment control via CSRF_ENABLED:
+ * - true (default): Enable CSRF for web APIs only (skip /api/app/*)
+ * - false: Disable CSRF completely for all APIs
  */
 const conditionalCsrfProtection = (req, res, next) => {
     const method = req.method.toUpperCase();
@@ -80,6 +84,12 @@ const conditionalCsrfProtection = (req, res, next) => {
 
     // Skip CSRF for safe methods
     if (safeMethods.includes(method)) {
+        return next();
+    }
+
+    // Global CSRF toggle via environment variable
+    const csrfEnabled = (process.env.CSRF_ENABLED ?? 'true').toString().toLowerCase();
+    if (csrfEnabled === 'false') {
         return next();
     }
 

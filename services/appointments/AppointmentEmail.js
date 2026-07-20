@@ -8,6 +8,7 @@ const logger = require('../../lib/logger');
 const emailService = require('../../lib/emailService');
 const AppointmentTPAPDF = require('./AppointmentComprehensivePDF');
 const { logTpaEmail } = require('../s_tap_email_log');
+const { triggerQCCompleted } = require('../../lib/tpaWebhookHelper');
 
 /**
  * Check if TPA email feature is enabled
@@ -16,6 +17,35 @@ const { logTpaEmail } = require('../s_tap_email_log');
 function isTpaEmailEnabled() {
     const enabled = process.env.TPA_EMAIL_ENABLED;
     return enabled === 'true' || enabled === '1';
+}
+
+function requiresAmountEvidence(costType) {
+    const normalized = String(costType || '').trim().toLowerCase();
+    return Boolean(normalized) && !['credit', 'client', 'client cost'].includes(normalized);
+}
+
+function validateAmountEvidence(appointment) {
+    if (!requiresAmountEvidence(appointment.cost_type)) {
+        return null;
+    }
+
+    const amount = Number(appointment.amount);
+    const hasAmount = Number.isFinite(amount) && amount > 0;
+    const hasEvidence = Boolean(String(appointment.amount_upload || '').trim());
+
+    if (hasAmount && hasEvidence) {
+        return null;
+    }
+
+    const missing = [];
+    if (!hasAmount) missing.push('amount');
+    if (!hasEvidence) missing.push('payment evidence');
+
+    return {
+        success: false,
+        message: `Please fill ${missing.join(' and ')} before sending TPA email for ${appointment.cost_type} appointments.`,
+        statusCode: 400
+    };
 }
 
 class AppointmentEmailService {
@@ -40,7 +70,7 @@ class AppointmentEmailService {
             // Fetch appointment with client details and diagnostic center emails
             const appointments = await db.query(
                 `SELECT a.*, 
-                        c.client_name, c.client_code, c.email_id as client_email, c.email_id_2 as client_email_2,
+                        c.client_name, c.client_code, c.email_id as client_email, c.email_id_2 as client_email_2, c.email_id_3 as client_email_3,
                         i.insurer_name, i.insurer_code,
                         dc.center_name, dc.email as center_email,
                         odc.center_name as other_center_name, odc.email as other_center_email,
@@ -65,6 +95,11 @@ class AppointmentEmailService {
 
             const appointment = appointments[0];
 
+            const amountEvidenceError = validateAmountEvidence(appointment);
+            if (amountEvidenceError) {
+                return amountEvidenceError;
+            }
+
             // Primary email is mandatory
             if (!appointment.client_email) {
                 return {
@@ -74,10 +109,13 @@ class AppointmentEmailService {
                 };
             }
 
-            // Build recipient list: primary required, secondary optional
+            // Build recipient list: primary required, secondary and tertiary optional
             const recipients = [appointment.client_email];
             if (appointment.client_email_2) {
                 recipients.push(appointment.client_email_2);
+            }
+            if (appointment.client_email_3) {
+                recipients.push(appointment.client_email_3);
             }
 
             // Build CC list with diagnostic center emails based on visit type
@@ -148,11 +186,60 @@ class AppointmentEmailService {
                 // Don't fail the email sending if logging fails
             }
 
+            // Trigger TPA webhook for QC completion with PDF and media
+            if (process.env.TPA_INTEGRATION_ENABLED === 'true') {
+                try {
+                    const pdfUrl = `${process.env.BASE_URL || 'http://localhost:3000'}/${pdfResult.pdfPath}`;
+                    
+                    // Fetch images and documents for QC completion
+                    const db = require('../../lib/dbconnection');
+                    
+                    // Fetch customer images
+                    const images = await db.query(`
+                        SELECT image_label, file_path 
+                        FROM appointment_customer_images 
+                        WHERE appointment_id = ? AND is_deleted = 0
+                        ORDER BY uploaded_at DESC
+                    `, [appointmentId]);
+
+                    // Fetch documents
+                    const documents = await db.query(`
+                        SELECT doc_type, doc_number, file_path 
+                        FROM appointment_documents 
+                        WHERE appointment_id = ? AND is_deleted = 0
+                        ORDER BY uploaded_at DESC
+                    `, [appointmentId]);
+                    
+                    const additionalData = {
+                        tpa_pdf_url: pdfUrl,
+                        customer_images: images,
+                        documents: documents
+                    };
+                    
+                    await triggerQCCompleted(appointmentId, additionalData);
+                    
+                    logger.info('Enhanced TPA webhook triggered for QC completion', { 
+                        appointmentId,
+                        case_number: appointment.case_number,
+                        pdf_url: pdfUrl
+                    });
+                } catch (webhookError) {
+                    logger.error('Failed to trigger enhanced TPA webhook for QC completion', { 
+                        appointmentId,
+                        error: webhookError.message 
+                    });
+                    // Don't fail the email sending if webhook fails
+                }
+            }
+
             return {
                 success: true,
-                message: `Report sent successfully to ${recipients.join(', ')}`,
-                sentTo: recipients,
-                clientName: appointment.client_name
+                message: 'Appointment completion email sent successfully',
+                data: {
+                    appointmentId,
+                    recipients,
+                    pdfPath: pdfResult.pdfPath
+                }
             };
         } catch (error) {
             logger.error('Error sending appointment email', {

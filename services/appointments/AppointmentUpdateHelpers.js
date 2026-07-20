@@ -10,6 +10,12 @@ const { emptyToNull } = require('../../lib/normalizers');
 // Safe value handler - returns null for undefined/null/empty values
 const safe = (value) => emptyToNull(value);
 
+function normalizeVisitSubtypeForAppointment(visitType, requestedSubtype) {
+    if (visitType === 'Home_Visit') return 'home';
+    if (visitType === 'Center_Visit') return 'center';
+    return requestedSubtype || 'center';
+}
+
 /**
  * Verify test rates against database to prevent tampering
  */
@@ -113,22 +119,42 @@ async function updateAppointmentBasicFields(connection, id, row) {
 /**
  * Find matching existing test for update
  */
-function findMatchingTest(existingTests, item, assignedCenterId, processedTestIds) {
-    // Try exact center match first
+function findMatchingTest(existingTests, item, assignedCenterId, visitSubtype, processedTestIds) {
+    const itemKeyMatches = (t) =>
+        t.rate_type === item.type &&
+        (item.type === 'test' ? t.test_id === item.id : t.category_id === item.id);
+
+    // Try exact center + exact side match first
     let match = existingTests.find(t =>
         !processedTestIds.has(t.id) &&
-        t.rate_type === item.type &&
-        (item.type === 'test' ? t.test_id === item.id : t.category_id === item.id) &&
-        t.assigned_center_id === assignedCenterId
+        itemKeyMatches(t) &&
+        t.assigned_center_id === assignedCenterId &&
+        (t.visit_subtype || 'center') === (visitSubtype || 'center')
     );
 
-    // If no exact match, try NULL center (orphaned/unassigned)
+    // If no exact match, try same item + same side even if the center changed
     if (!match) {
         match = existingTests.find(t =>
             !processedTestIds.has(t.id) &&
-            t.rate_type === item.type &&
-            (item.type === 'test' ? t.test_id === item.id : t.category_id === item.id) &&
+            itemKeyMatches(t) &&
+            (t.visit_subtype || 'center') === (visitSubtype || 'center')
+        );
+    }
+
+    // If still no match, try orphaned/unassigned row of the same item
+    if (!match) {
+        match = existingTests.find(t =>
+            !processedTestIds.has(t.id) &&
+            itemKeyMatches(t) &&
             t.assigned_center_id === null
+        );
+    }
+
+    // Final fallback: same item anywhere, so center edits reuse the row instead of duplicating it
+    if (!match) {
+        match = existingTests.find(t =>
+            !processedTestIds.has(t.id) &&
+            itemKeyMatches(t)
         );
     }
 
@@ -192,10 +218,7 @@ async function insertNewTest(connection, appointmentId, item, assignedCenterId, 
  * Delete removed tests (selective deletion by center)
  */
 async function deleteRemovedTests(connection, appointmentId, existingTests, processedTestIds, centersBeingUpdated) {
-    const testsToDelete = existingTests.filter(t =>
-        !processedTestIds.has(t.id) &&
-        (centersBeingUpdated.size === 0 || centersBeingUpdated.has(t.assigned_center_id))
-    );
+    const testsToDelete = existingTests.filter(t => !processedTestIds.has(t.id));
 
     if (testsToDelete.length > 0) {
         const idsToDelete = testsToDelete.map(t => t.id);
@@ -221,6 +244,7 @@ async function processTestAssignments(connection, appointmentId, selectedItems, 
 
     const processedTestIds = new Set();
     const centersBeingUpdated = new Set();
+    const seenIncomingKeys = new Set();
 
     // Process incoming items (Update or Insert)
     for (const item of selectedItems) {
@@ -238,12 +262,27 @@ async function processTestAssignments(connection, appointmentId, selectedItems, 
             centersBeingUpdated.add(assignedCenterId);
         }
 
-        const visitSubtype = item.assigned_technician_id ? 'home' : (item.visit_subtype || 'center');
-        const assignedTechnicianId = item.assigned_technician_id || null;
+        const visitSubtype = normalizeVisitSubtypeForAppointment(
+            appointment.visit_type,
+            item.assigned_technician_id ? 'home' : item.visit_subtype
+        );
+        const assignedTechnicianId = visitSubtype === 'center' ? null : (item.assigned_technician_id || null);
         const rate = parseFloat(item.rate);
+        const incomingKey = [
+            item.type,
+            item.id,
+            assignedCenterId || 'null',
+            visitSubtype || 'center',
+            assignedTechnicianId || 'null'
+        ].join(':');
+
+        if (seenIncomingKeys.has(incomingKey)) {
+            continue;
+        }
+        seenIncomingKeys.add(incomingKey);
 
         // Find matching existing test
-        const match = findMatchingTest(existingTests, item, assignedCenterId, processedTestIds);
+        const match = findMatchingTest(existingTests, item, assignedCenterId, visitSubtype, processedTestIds);
 
         if (match) {
             // Update existing test
@@ -289,6 +328,7 @@ module.exports = {
     verifyTestRates,
     updateAppointmentBasicFields,
     processTestAssignments,
+    normalizeVisitSubtypeForAppointment,
     findMatchingTest,
     updateExistingTest,
     insertNewTest,

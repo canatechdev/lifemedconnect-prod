@@ -5,6 +5,8 @@
  */
 
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const router = express.Router();
 
 const { verifyToken } = require('../../lib/auth');
@@ -13,24 +15,44 @@ const logger = require('../../lib/logger');
 const db = require('../../lib/dbconnection');
 const { updateWithApproval, formatApprovalResponse } = require('../../lib/approvalHelper');
 const appointmentService = require('../../services/app/s_app_appointments');
+const caseTrackerService = require('../../services/app/s_app_case_tracker');
 const coreAppointments = require('../../services/appointments');
 const { uploadLimiter } = require('../../middleware/security');
 const { mixedUpload } = require('../../lib/multer');
 const { processSingleFile, processMultipleFiles } = require('../../lib/fileUpload');
 
+function getAppointmentIdParam(req) {
+    const appointmentId = parseInt(req.params.id, 10);
+    return Number.isNaN(appointmentId) ? null : appointmentId;
+}
+
+function setPdfHeaders(res, filename, length = null) {
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+    if (length !== null) {
+        res.setHeader('Content-Length', length);
+    }
+}
+
 // GET /api/app/appointments
-// List all appointments assigned to the technician (with tests limited to technician)
+// List all appointments for the logged-in technician or center
 router.get('/appointments', verifyToken, async (req, res) => {
     try {
         const page = parseInt(req.query.page, 10) || 1;
         const limit = parseInt(req.query.limit, 10) || 10;
         const search = req.query.q || '';
+        const fromDate = req.query.fromDate || '';
+        const toDate = req.query.toDate || '';
+        const visitType = req.query.visitType || '';
 
-        const result = await appointmentService.listTechnicianAppointments({
+        const result = await appointmentService.listAppointments({
             userId: req.user.id,
             page,
             limit,
             search,
+            fromDate,
+            toDate,
+            visitType,
             upcomingOnly: false
         });
 
@@ -54,13 +76,19 @@ router.get('/appointments/status/:group', verifyToken, async (req, res) => {
         const page = parseInt(req.query.page, 10) || 1;
         const limit = parseInt(req.query.limit, 10) || 10;
         const search = req.query.q || '';
+        const fromDate = req.query.fromDate || '';
+        const toDate = req.query.toDate || '';
+        const visitType = req.query.visitType || '';
 
-        const result = await appointmentService.listTechnicianAppointments({
+        const result = await appointmentService.listAppointments({
             userId: req.user.id,
             page,
             limit,
             search,
-            statusGroup: group
+            statusGroup: group,
+            fromDate,
+            toDate,
+            visitType
         });
 
         return ApiResponse.paginated(res, result.data, result.pagination);
@@ -71,19 +99,25 @@ router.get('/appointments/status/:group', verifyToken, async (req, res) => {
 });
 
 // GET /api/app/appointments/upcoming
-// List upcoming appointments (confirmed_date tomorrow onwards) assigned to technician
+// List upcoming appointments (confirmed_date tomorrow onwards)
 router.get('/appointments/upcoming', verifyToken, async (req, res) => {
     try {
         const page = parseInt(req.query.page, 10) || 1;
         const limit = parseInt(req.query.limit, 10) || 10;
         const search = req.query.q || '';
+        const fromDate = req.query.fromDate || '';
+        const toDate = req.query.toDate || '';
+        const visitType = req.query.visitType || '';
 
-        const result = await appointmentService.listTechnicianAppointments({
+        const result = await appointmentService.listAppointments({
             userId: req.user.id,
             page,
             limit,
             search,
-            upcomingOnly: true
+            upcomingOnly: true,
+            fromDate,
+            toDate,
+            visitType
         });
 
         return ApiResponse.paginated(res, result.data, result.pagination);
@@ -94,18 +128,21 @@ router.get('/appointments/upcoming', verifyToken, async (req, res) => {
 });
 
 // GET /api/app/appointments/today
-// List today's appointments assigned to technician (by confirmed_date fallback appointment_date)
+// List today's appointments
 router.get('/appointments/today', verifyToken, async (req, res) => {
     try {
         const page = parseInt(req.query.page, 10) || 1;
         const limit = parseInt(req.query.limit, 10) || 10;
         const search = req.query.q || '';
+        const visitType = req.query.visitType || '';
 
-        const result = await appointmentService.listTechnicianTodayAppointments({
+        const result = await appointmentService.listAppointments({
             userId: req.user.id,
             page,
             limit,
-            search
+            search,
+            todayOnly: true,
+            visitType
         });
 
         return ApiResponse.paginated(res, result.data, result.pagination);
@@ -115,9 +152,100 @@ router.get('/appointments/today', verifyToken, async (req, res) => {
     }
 });
 
+// GET /api/app/appointments/tracker/search?q=CASE/26/05/0014
+// Compact case tracker payload for the mobile app.
+router.get('/appointments/tracker/search', verifyToken, async (req, res) => {
+    try {
+        const q = String(req.query.q || '').trim();
+        if (!q) {
+            return ApiResponse.appError(res, 'Search term is required', 400);
+        }
+
+        const baseUrl = global.BASE_URL || `http://localhost:${process.env.PORT || 5050}`;
+        const tracker = await caseTrackerService.getCaseTracker({
+            user: req.user,
+            searchTerm: q,
+            baseUrl
+        });
+
+        if (!tracker) {
+            return ApiResponse.appError(res, 'Appointment not found', 404);
+        }
+
+        return ApiResponse.appSuccess(res, 'Case tracker fetched successfully', tracker);
+    } catch (error) {
+        const statusCode = error.statusCode || 500;
+        logger.error('App case tracker failed', {
+            error: error.message,
+            userId: req.user?.id,
+            searchTerm: req.query?.q
+        });
+        return ApiResponse.appError(
+            res,
+            statusCode === 403 ? error.message : 'Failed to fetch case tracker',
+            statusCode
+        );
+    }
+});
+
+// GET /api/app/appointments/tracker/public/:id/proforma-invoice
+// Public direct PDF link for the mobile case tracker response. Web PDF routes remain authenticated.
+router.get('/appointments/tracker/public/:id/proforma-invoice', async (req, res) => {
+    try {
+        const appointmentId = getAppointmentIdParam(req);
+        if (!appointmentId) {
+            return ApiResponse.appError(res, 'Invalid appointment id', 400);
+        }
+
+        const result = await coreAppointments.generateProformaInvoicePdf(appointmentId);
+        if (!result || !result.pdfBuffer) {
+            return ApiResponse.notFound(res, 'Proforma invoice data not found');
+        }
+
+        setPdfHeaders(res, `proforma-invoice-${appointmentId}.pdf`, result.pdfBuffer.length);
+        return res.end(result.pdfBuffer);
+    } catch (error) {
+        logger.error('App tracker public proforma invoice failed', {
+            appointmentId: req.params.id,
+            error: error.message
+        });
+        return ApiResponse.appError(res, 'Failed to download proforma invoice', 500);
+    }
+});
+
+// GET /api/app/appointments/tracker/public/:id/tpa-pdf
+// Public direct PDF link for the mobile case tracker response. Web PDF routes remain authenticated.
+router.get('/appointments/tracker/public/:id/tpa-pdf', async (req, res) => {
+    try {
+        const appointmentId = getAppointmentIdParam(req);
+        if (!appointmentId) {
+            return ApiResponse.appError(res, 'Invalid appointment id', 400);
+        }
+
+        const result = await coreAppointments.generateTPAPDF(appointmentId);
+        if (!result || !result.pdfPath) {
+            return ApiResponse.notFound(res, 'TPA PDF not found');
+        }
+
+        const absolutePath = path.resolve(result.pdfPath);
+        if (!fs.existsSync(absolutePath)) {
+            return ApiResponse.notFound(res, 'TPA PDF file not found');
+        }
+
+        setPdfHeaders(res, `TPA_${appointmentId}.pdf`);
+        return res.sendFile(absolutePath);
+    } catch (error) {
+        logger.error('App tracker public TPA PDF failed', {
+            appointmentId: req.params.id,
+            error: error.message
+        });
+        return ApiResponse.appError(res, 'Failed to download TPA PDF', 500);
+    }
+});
+
 
 // GET /api/app/appointments/:id
-// Detailed appointment view for the assigned technician
+// Detailed appointment view for the logged-in technician or center
 router.get('/appointments/:id', verifyToken, async (req, res) => {
     try {
         const appointmentId = parseInt(req.params.id, 10);
@@ -125,24 +253,24 @@ router.get('/appointments/:id', verifyToken, async (req, res) => {
             return ApiResponse.appError(res, 'Invalid appointment id', 400);
         }
 
-        const details = await appointmentService.getTechnicianAppointmentDetails({
+        const details = await appointmentService.getAppointmentDetails({
             userId: req.user.id,
             appointmentId
         });
 
         if (!details) {
-            return ApiResponse.appError(res, 'Appointment not found or not assigned', 404);
+            return ApiResponse.appError(res, 'Appointment not found or not authorized', 404);
         }
 
         return ApiResponse.appSuccess(res, 'Appointment details fetched', details);
     } catch (error) {
-        logger.error('App get appointment details (technician) failed', { error: error.message, userId: req.user?.id, appointmentId: req.params?.id });
+        logger.error('App get appointment details failed', { error: error.message, userId: req.user?.id, appointmentId: req.params?.id });
         return ApiResponse.appError(res, 'Failed to fetch appointment details', 500);
     }
 });
 
 // POST /api/app/appointments/:id/push-back
-// Technician push-back on own appointment/tests
+// Push-back for technician or center
 router.post('/appointments/:id/push-back', verifyToken, async (req, res) => {
     try {
         const appointmentId = parseInt(req.params.id, 10);
@@ -154,12 +282,12 @@ router.post('/appointments/:id/push-back', verifyToken, async (req, res) => {
             return ApiResponse.appError(res, 'remarks is required', 400);
         }
 
-        const { technicianId, owns } = await appointmentService.getTechnicianContextForAppointment(appointmentId, req.user.id);
-        if (!technicianId || !owns) {
+        const { owns, actorContext } = await appointmentService.getAppScopeForAppointment(appointmentId, req.user.id);
+        if (!owns) {
             return ApiResponse.appError(res, 'Not authorized for this appointment', 403);
         }
 
-        const result = await coreAppointments.pushBackAppointment(appointmentId, remarks, req.user.id);
+        const result = await coreAppointments.pushBackAppointment(appointmentId, remarks, req.user.id, actorContext);
         return ApiResponse.appSuccess(res, 'Appointment pushed back', result);
     } catch (error) {
         logger.error('App push-back failed', { error: error.message, userId: req.user?.id, appointmentId: req.params?.id });
@@ -181,21 +309,15 @@ router.post('/appointments/:id/reschedule', verifyToken, async (req, res) => {
             return ApiResponse.appError(res, 'confirmed_date and confirmed_time are required', 400);
         }
 
-        const { technicianId, owns } = await appointmentService.getTechnicianContextForAppointment(appointmentId, req.user.id);
-        if (!technicianId || !owns) {
+        const { owns, actorContext } = await appointmentService.getAppScopeForAppointment(appointmentId, req.user.id);
+        if (!owns) {
             return ApiResponse.appError(res, 'Not authorized for this appointment', 403);
         }
 
         const normalizedDate = confirmed_date; // app already sends yyyy-mm-dd
         const normalizedTime = confirmed_time; // app already sends hh:mm
 
-        // Build actor context for technician
-        const actorContext = {
-            technicianId: technicianId,
-            type: 'technician'
-        };
-
-        // Direct reschedule without approval for technicians
+        // Direct reschedule without approval for both technicians and centers
         const result = await coreAppointments.rescheduleAppointment(
             appointmentId,
             normalizedDate,
@@ -232,19 +354,30 @@ router.post('/appointments/:id/confirm-schedule', verifyToken, async (req, res) 
             return ApiResponse.appError(res, 'confirmed_date and confirmed_time are required', 400);
         }
 
-        const { technicianId, owns } = await appointmentService.getTechnicianContextForAppointment(appointmentId, req.user.id);
-        if (!technicianId || !owns) {
+        const { owns, actorContext } = await appointmentService.getAppScopeForAppointment(appointmentId, req.user.id);
+        if (!owns) {
             return ApiResponse.appError(res, 'Not authorized for this appointment', 403);
         }
 
         const normalizedDate = confirmed_date; // app already sends yyyy-mm-dd
         const normalizedTime = confirmed_time; // app already sends hh:mm
 
-        // Build actor context for technician
-        const actorContext = {
-            technicianId: technicianId,
-            type: 'technician'
-        };
+        // Centers: direct confirm, no approval. Technicians: approval flow.
+        if (actorContext.type === 'center') {
+            await coreAppointments.confirmSchedule(
+                appointmentId,
+                normalizedDate,
+                normalizedTime,
+                req.user.id,
+                actorContext
+            );
+            return ApiResponse.appSuccess(res, 'Schedule confirmed successfully', {
+                needsApproval: false,
+                appointmentId,
+                confirmed_date: normalizedDate,
+                confirmed_time: normalizedTime
+            });
+        }
 
         const result = await updateWithApproval({
             entity_type: 'appointment',
@@ -297,22 +430,19 @@ router.get('/appointments/:id/update-medical-status', verifyToken, async (req, r
             return ApiResponse.appError(res, 'medical_status is required', 400);
         }
 
-        const { technicianId, owns } = await appointmentService.getTechnicianContextForAppointment(appointmentId, req.user.id);
-        if (!technicianId || !owns) {
+        const { owns, actorContext } = await appointmentService.getAppScopeForAppointment(appointmentId, req.user.id);
+        if (!owns) {
             return ApiResponse.appError(res, 'Not authorized for this appointment', 403);
         }
 
-        // Fetch technician's center for actor context
-        const [techData] = await db.query(
-            'SELECT center_id FROM technicians WHERE id = ?',
-            [technicianId]
-        );
-
-        const actorContext = {
-            technicianId: technicianId,
-            centerId: techData[0]?.center_id || null,
-            type: 'technician'
-        };
+        // For technician, enrich actorContext with center_id
+        if (actorContext.type === 'technician') {
+            const [techData] = await db.query(
+                'SELECT center_id FROM technicians WHERE id = ?',
+                [actorContext.technicianId]
+            );
+            actorContext.centerId = techData[0]?.center_id || null;
+        }
 
         // Update medical status
         const result = await coreAppointments.updateMedicalStatus(
@@ -358,22 +488,20 @@ router.post('/appointments/:id/medical-status',
                 return ApiResponse.appError(res, 'pending_report_types is required for partially_completed', 400);
             }
 
-            const { technicianId, owns } = await appointmentService.getTechnicianContextForAppointment(appointmentId, req.user.id);
-            if (!technicianId || !owns) {
+            
+            const { owns, actorContext } = await appointmentService.getAppScopeForAppointment(appointmentId, req.user.id);
+            if (!owns) {
                 return ApiResponse.appError(res, 'Not authorized for this appointment', 403);
             }
 
-            // Fetch technician's center for actor context
-            const [techData] = await db.query(
-                'SELECT center_id FROM technicians WHERE id = ?',
-                [technicianId]
-            );
-
-            const actorContext = {
-                technicianId: technicianId,
-                centerId: techData[0]?.center_id || null,
-                type: 'technician'
-            };
+            // For technician, enrich actorContext with center_id
+            if (actorContext.type === 'technician') {
+                const [techData] = await db.query(
+                    'SELECT center_id FROM technicians WHERE id = ?',
+                    [actorContext.technicianId]
+                );
+                actorContext.centerId = techData[0]?.center_id || null;
+            }
 
             let pendingTypesArray = [];
             if (pending_report_types) {
@@ -384,54 +512,11 @@ router.post('/appointments/:id/medical-status',
                 }
             }
 
-            // Optional file handling for documents and customer images
-            if (req.files && req.files.length > 0) {
-                for (const file of req.files) {
-                    if (file.fieldname.startsWith('doc_')) {
-                        const suffix = file.fieldname.replace('doc_', '');
-                        const docType = req.body[`docType_${suffix}`] || req.body.docType || '';
-                        const docNumber = req.body[`docNumber_${suffix}`] || req.body.docNumber || '';
-
-                        const filePath = await processSingleFile(file, 'appointment_documents');
-                        await coreAppointments.addDocument(
-                            appointmentId,
-                            docType,
-                            docNumber,
-                            filePath,
-                            file.originalname,
-                            req.user.id
-                        );
-                    }
-
-                    if (file.fieldname.startsWith('customer_')) {
-                        const suffix = file.fieldname.replace('customer_', '');
-                        const imageLabel = req.body[`imageLabel_${suffix}`] || req.body.imageLabel || '';
-
-                        const filePath = await processSingleFile(file, 'appointment_customer_images');
-                        await coreAppointments.addCustomerImage(
-                            appointmentId,
-                            imageLabel,
-                            filePath,
-                            file.originalname,
-                            req.user.id
-                        );
-                    }
-                }
-            }
-
             // COMPLETED path -> direct completion without approval for all users
             if (medical_status === 'completed') {
                 let filesMeta = [];
                 if (req.files && req.files.length > 0) {
                     filesMeta = await processMultipleFiles(req.files, 'appointment_medical');
-                }
-
-                if (filesMeta.length > 0) {
-                    await coreAppointments.saveAppointmentMedicalFiles(
-                        appointmentId,
-                        filesMeta,
-                        req.user.id
-                    );
                 }
 
                 // APPROVAL REMOVED: Medical completion no longer requires approval for any user
@@ -452,12 +537,55 @@ router.post('/appointments/:id/medical-status',
                 // Fetch and return completion status for 'Both' appointments
                 const completionStatus = await coreAppointments.getAppointmentCompletionStatus(appointmentId);
 
+                if (!result?.noChange && filesMeta.length > 0) {
+                    await coreAppointments.saveAppointmentMedicalFiles(
+                        appointmentId,
+                        filesMeta,
+                        req.user.id
+                    );
+                }
+
+                if (!result?.noChange && req.files && req.files.length > 0) {
+                    for (const file of req.files) {
+                        if (file.fieldname.startsWith('doc_')) {
+                            const suffix = file.fieldname.replace('doc_', '');
+                            const docType = req.body[`docType_${suffix}`] || req.body.docType || '';
+                            const docNumber = req.body[`docNumber_${suffix}`] || req.body.docNumber || '';
+
+                            const filePath = await processSingleFile(file, 'appointment_documents');
+                            await coreAppointments.addDocument(
+                                appointmentId,
+                                docType,
+                                docNumber,
+                                filePath,
+                                file.originalname,
+                                req.user.id
+                            );
+                            continue;
+                        }
+
+                        if (file.fieldname.startsWith('customer_')) {
+                            const suffix = file.fieldname.replace('customer_', '');
+                            const imageLabel = req.body[`imageLabel_${suffix}`] || req.body.imageLabel || '';
+
+                            const filePath = await processSingleFile(file, 'appointment_customer_images');
+                            await coreAppointments.addCustomerImage(
+                                appointmentId,
+                                imageLabel,
+                                filePath,
+                                file.originalname,
+                                req.user.id
+                            );
+                        }
+                    }
+                }
+
                 return ApiResponse.appSuccess(res, {
                     ...result,
                     completion_status: completionStatus
                 });
             }
-
+           
             // Normal path for arrived / in_process / partially_completed
             const result = await coreAppointments.updateMedicalStatus(
                 appointmentId,
@@ -474,6 +602,41 @@ router.post('/appointments/:id/medical-status',
 
             // Fetch and return completion status
             const completionStatus = await coreAppointments.getAppointmentCompletionStatus(appointmentId);
+
+            if (!result?.noChange && req.files && req.files.length > 0) {
+                for (const file of req.files) {
+                    if (file.fieldname.startsWith('doc_')) {
+                        const suffix = file.fieldname.replace('doc_', '');
+                        const docType = req.body[`docType_${suffix}`] || req.body.docType || '';
+                        const docNumber = req.body[`docNumber_${suffix}`] || req.body.docNumber || '';
+
+                        const filePath = await processSingleFile(file, 'appointment_documents');
+                        await coreAppointments.addDocument(
+                            appointmentId,
+                            docType,
+                            docNumber,
+                            filePath,
+                            file.originalname,
+                            req.user.id
+                        );
+                        continue;
+                    }
+
+                    if (file.fieldname.startsWith('customer_')) {
+                        const suffix = file.fieldname.replace('customer_', '');
+                        const imageLabel = req.body[`imageLabel_${suffix}`] || req.body.imageLabel || '';
+
+                        const filePath = await processSingleFile(file, 'appointment_customer_images');
+                        await coreAppointments.addCustomerImage(
+                            appointmentId,
+                            imageLabel,
+                            filePath,
+                            file.originalname,
+                            req.user.id
+                        );
+                    }
+                }
+            }
 
             const messages = {
                 arrived: 'Arrival marked successfully',
@@ -506,8 +669,8 @@ router.post('/appointments/:id/upload-docs-images',
                 return ApiResponse.appError(res, 'Invalid appointment id', 400);
             }
 
-            const { technicianId, owns } = await appointmentService.getTechnicianContextForAppointment(appointmentId, req.user.id);
-            if (!technicianId || !owns) {
+            const { owns } = await appointmentService.getAppScopeForAppointment(appointmentId, req.user.id);
+            if (!owns) {
                 return ApiResponse.appError(res, 'Not authorized for this appointment', 403);
             }
 
@@ -587,8 +750,8 @@ router.get('/appointments/:id/docs-images', verifyToken, async (req, res) => {
             return ApiResponse.appError(res, 'Invalid appointment id', 400);
         }
 
-        const { technicianId, owns } = await appointmentService.getTechnicianContextForAppointment(appointmentId, req.user.id);
-        if (!technicianId || !owns) {
+        const { owns } = await appointmentService.getAppScopeForAppointment(appointmentId, req.user.id);
+        if (!owns) {
             return ApiResponse.appError(res, 'Not authorized for this appointment', 403);
         }
 

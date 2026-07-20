@@ -6,6 +6,8 @@ const userService = require('../s_user');
 const emailService = require('../../lib/emailService');
 
 const TECHNICIAN_ROLE_ID = 4; // current technician role
+const CENTER_ROLE_ID = 3; // diagnostic center role
+const ALLOWED_APP_ROLES = [TECHNICIAN_ROLE_ID, CENTER_ROLE_ID];
 
 // Get OTP expiry from ENV or default to 10 minutes
 function getOtpExpiryMinutes() {
@@ -27,6 +29,7 @@ function maskEmail(email) {
 
 function mapUserResponse(user) {
     const baseUrl = global.BASE_URL || '';
+    const isCenter = Number(user.role_id) === CENTER_ROLE_ID;
     return {
         id: user.id,
         username: user.username,
@@ -34,11 +37,13 @@ function mapUserResponse(user) {
         full_name: user.full_name,
         mobile: user.mobile,
         role_id: user.role_id,
+        user_type: isCenter ? 'center' : 'technician',
         technician_id: user.technician_id || null,
         technician_type: user.technician_type || null,
         rate_per_appointment: user.rate_per_appointment ? Number(user.rate_per_appointment) : 0,
         profile_pic: user.profile_pic ? `${baseUrl}/${user.profile_pic.replace(/\\/g, '/')}` : null,
         diagnostic_center_id: user.diagnostic_center_id || null,
+        center_name: user.center_name || null,
     };
 }
 
@@ -67,8 +72,7 @@ async function login({ username, password }) {
         return { success: false, message: 'Invalid username or password' };
     }
 
-    // Only allow technician role for now (extendable later)
-    if (Number(user.role_id) !== TECHNICIAN_ROLE_ID) {
+    if (!ALLOWED_APP_ROLES.includes(Number(user.role_id))) {
         return { success: false, message: 'Access denied for this user role' };
     }
 
@@ -102,7 +106,7 @@ async function changePassword({ userId, oldPassword, newPassword }) {
     if (!user) {
         throw new Error('User not found');
     }
-    if (Number(user.role_id) !== TECHNICIAN_ROLE_ID) {
+    if (!ALLOWED_APP_ROLES.includes(Number(user.role_id))) {
         return { success: false, message: 'Access denied for this user role' };
     }
     if (Number(user.is_active) === 0) {

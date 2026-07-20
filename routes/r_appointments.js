@@ -15,6 +15,14 @@ const { deleteWithApproval, updateWithApproval, formatApprovalResponse, createWi
 const { toMySqlDate, toMySqlTime, toFloat } = require('../lib/normalizers');
 const { pdfUpload, imageUpload, excelUpload, mixedUpload } = require('../lib/multer');
 const { processSingleFile, processMultipleFiles, handleSingleFileFromAny, handleExcelFile } = require('../lib/fileUpload');
+const { 
+    triggerAppointmentConfirmed,
+    triggerAppointmentRescheduled,
+    triggerAppointmentCancelled,
+    triggerMedicalStatusUpdate,
+    triggerQCCompleted,
+    triggerEnhancedWebhookNow
+} = require('../lib/tpaWebhookHelper');
 const fs = require('fs');
 const path = require('path');
 const db = require('../lib/dbconnection');
@@ -31,6 +39,57 @@ async function getCaseNumber(appointmentId) {
         const rows = await db.query('SELECT case_number FROM appointments WHERE id = ?', [appointmentId]);
         return rows?.[0]?.case_number || '';
     } catch { return ''; }
+}
+
+// Helper: Fetch customer images and documents for patient arrival
+async function fetchArrivalData(appointmentId) {
+    try {
+        logger.info('Fetching arrival data for webhook', { appointmentId });
+        
+        const caseNumber = await getCaseNumber(appointmentId);
+        if (!caseNumber) {
+            logger.warn('No case number found for appointment', { appointmentId });
+            return { customer_images: [], documents: [] };
+        }
+
+        // Fetch customer images
+        const images = await db.query(`
+            SELECT image_label, file_path 
+            FROM appointment_customer_images 
+            WHERE appointment_id = ? AND is_deleted = 0
+            ORDER BY uploaded_at DESC
+        `, [appointmentId]);
+
+        // Fetch documents
+        const documents = await db.query(`
+            SELECT doc_type, doc_number, file_path 
+            FROM appointment_documents 
+            WHERE appointment_id = ? AND is_deleted = 0
+            ORDER BY uploaded_at DESC
+        `, [appointmentId]);
+
+        const result = {
+            customer_images: images,
+            documents: documents
+        };
+
+        logger.info('Arrival data fetched successfully', {
+            appointmentId,
+            imagesCount: images.length,
+            documentsCount: documents.length,
+            imageLabels: images.map(img => img.image_label),
+            documentTypes: documents.map(doc => doc.doc_type)
+        });
+
+        return result;
+
+    } catch (error) {
+        logger.error('Error fetching arrival data', { 
+            appointmentId, 
+            error: error.message 
+        });
+        return { customer_images: [], documents: [] };
+    }
 }
 
 // Import validation schemas
@@ -113,7 +172,7 @@ router.get('/appointments/export',
         });
 
         // Fetch all appointments matching filters
-        const appointments = await service.getAppointmentsForExport(filters);
+        const appointments = await service.getAppointmentsForExport(filters, req.user);
 
         // Generate Excel workbook
         const workbook = await service.generateExportExcel(appointments, filters);
@@ -270,6 +329,28 @@ router.post('/appointments',
     })
 );
 
+// Clone Appointment
+router.post('/appointments/:id/clone',
+    verifyToken,
+    requirePermission('appointments.create'),
+    asyncHandler(async (req, res) => {
+        const appointmentId = parseInt(req.params.id, 10);
+        if (!appointmentId) {
+            return ApiResponse.error(res, 'Valid appointment ID is required', 400);
+        }
+
+        const result = await service.cloneAppointment(appointmentId, req.user.id);
+        logger.info('Appointment cloned', {
+            sourceAppointmentId: appointmentId,
+            clonedAppointmentId: result.id,
+            caseNumber: result.case_number,
+            userId: req.user.id
+        });
+
+        return ApiResponse.success(res, result, 'Appointment duplicated successfully', 201);
+    })
+);
+
 // LIST Appointments
 router.get('/appointments', verifyToken, requirePermission('appointments.view'), asyncHandler(async (req, res) => {
     const page = parseInt(req.query.page) || 1;
@@ -355,14 +436,70 @@ router.get('/appointments/admin/pending', verifyToken, requirePermission('appoin
     const sortBy = req.query.sortBy || 'id';
     const sortOrder = req.query.sortOrder || 'DESC';
     const customerCategory = req.query.customerCategory || '';
+    
+    // Advanced filtering parameters
+    const month = req.query.month || '';
+    const year = req.query.year || '';
+    const visitType = req.query.visitType || '';
+    const status = req.query.status || '';
+    const medicalStatus = req.query.medicalStatus || '';
+    const qcStatus = req.query.qcStatus || '';
+    const dateField = req.query.dateField || 'created_at';
+    const rangeType = req.query.rangeType || '';
+    const fromDate = req.query.fromDate || '';
+    const toDate = req.query.toDate || '';
+    const centerIds = req.query.centerIds ? req.query.centerIds.split(',').filter(id => id.trim()) : [];
 
-    // Use listPendingAppointments for pushed back appointments
     const result = await service.listPendingAppointments({ 
         page, 
         limit, 
         search,
-        customerCategory
+        customerCategory,
+        month, year, visitType, status, medicalStatus, qcStatus,
+        dateField, rangeType, fromDate, toDate, centerIds
     });
+    return ApiResponse.paginated(res, result.data, result.pagination);
+}));
+
+// Center - Get pending (pushed back) appointments
+router.get('/appointments/center/pending', verifyToken, requirePermission('appointments.view'), asyncHandler(async (req, res) => {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const search = req.query.q || '';
+    const sortBy = req.query.sortBy || 'id';
+    const sortOrder = req.query.sortOrder || 'DESC';
+    const customerCategory = req.query.customerCategory || '';
+
+    // centerId comes from token (req.user)
+    const centerId = req.user.diagnostic_center_id;
+
+    if (!centerId) {
+        return ApiResponse.error(res, "Center ID missing in token", 400);
+    }
+
+    // Advanced filtering parameters
+    const month = req.query.month || '';
+    const year = req.query.year || '';
+    const visitType = req.query.visitType || '';
+    const status = req.query.status || '';
+    const medicalStatus = req.query.medicalStatus || '';
+    const qcStatus = req.query.qcStatus || '';
+    const dateField = req.query.dateField || 'created_at';
+    const rangeType = req.query.rangeType || '';
+    const fromDate = req.query.fromDate || '';
+    const toDate = req.query.toDate || '';
+    const centerIds = req.query.centerIds ? req.query.centerIds.split(',').filter(id => id.trim()) : [];
+
+    const result = await service.listCenterPendingAppointments({
+        page,
+        limit,
+        search,
+        centerId,
+        customerCategory,
+        month, year, visitType, status, medicalStatus, qcStatus,
+        dateField, rangeType, fromDate, toDate, centerIds
+    });
+
     return ApiResponse.paginated(res, result.data, result.pagination);
 }));
 
@@ -374,8 +511,25 @@ router.get('/appointments/confirmed', verifyToken, requirePermission('appointmen
     const sortBy = req.query.sortBy || 'confirmed_date';
     const sortOrder = req.query.sortOrder || 'DESC';
     const customerCategory = req.query.customerCategory || '';
+    
+    // Advanced filtering parameters
+    const month = req.query.month || '';
+    const year = req.query.year || '';
+    const visitType = req.query.visitType || '';
+    const status = req.query.status || '';
+    const medicalStatus = req.query.medicalStatus || '';
+    const qcStatus = req.query.qcStatus || '';
+    const dateField = req.query.dateField || 'created_at';
+    const rangeType = req.query.rangeType || '';
+    const fromDate = req.query.fromDate || '';
+    const toDate = req.query.toDate || '';
+    const centerIds = req.query.centerIds ? req.query.centerIds.split(',').filter(id => id.trim()) : [];
 
-    const result = await service.listAllConfirmedAppointments({ page, limit, search, sortBy, sortOrder, customerCategory });
+    const result = await service.listAllConfirmedAppointments({ 
+        page, limit, search, sortBy, sortOrder, customerCategory,
+        month, year, visitType, status, medicalStatus, qcStatus,
+        dateField, rangeType, fromDate, toDate, centerIds
+    });
     return ApiResponse.paginated(res, result.data, result.pagination);
 }));
 
@@ -388,8 +542,25 @@ router.get('/appointments/report', verifyToken, requirePermission('appointments.
     const sortOrder = req.query.sortOrder || 'DESC';
     const type = 'completed';
     const customerCategory = req.query.customerCategory || '';
+    
+    // Advanced filtering parameters
+    const month = req.query.month || '';
+    const year = req.query.year || '';
+    const visitType = req.query.visitType || '';
+    const status = req.query.status || '';
+    const medicalStatus = req.query.medicalStatus || '';
+    const qcStatus = req.query.qcStatus || '';
+    const dateField = req.query.dateField || 'created_at';
+    const rangeType = req.query.rangeType || '';
+    const fromDate = req.query.fromDate || '';
+    const toDate = req.query.toDate || '';
+    const centerIds = req.query.centerIds ? req.query.centerIds.split(',').filter(id => id.trim()) : [];
 
-    const result = await service.listAllConfirmedAppointments({ page, limit, search, listType: type, sortBy, sortOrder, customerCategory });
+    const result = await service.listAllConfirmedAppointments({ 
+        page, limit, search, listType: type, sortBy, sortOrder, customerCategory,
+        month, year, visitType, status, medicalStatus, qcStatus,
+        dateField, rangeType, fromDate, toDate, centerIds
+    });
     return ApiResponse.paginated(res, result.data, result.pagination);
 }));
 
@@ -402,8 +573,25 @@ router.get('/appointments/DiagnosticCenter', verifyToken, requirePermission('app
     const centerId = centerIdRaw !== undefined ? parseInt(centerIdRaw) : undefined;
     const listType = req.query.listType || 'all';
     const customerCategory = req.query.customerCategory || '';
+    
+    // Advanced filtering parameters
+    const month = req.query.month || '';
+    const year = req.query.year || '';
+    const visitType = req.query.visitType || '';
+    const status = req.query.status || '';
+    const medicalStatus = req.query.medicalStatus || '';
+    const qcStatus = req.query.qcStatus || '';
+    const dateField = req.query.dateField || 'created_at';
+    const rangeType = req.query.rangeType || '';
+    const fromDate = req.query.fromDate || '';
+    const toDate = req.query.toDate || '';
+    const centerIds = req.query.centerIds ? req.query.centerIds.split(',').filter(id => id.trim()) : [];
 
-    const result = await service.listAppointmentsbyDiagnosticCenters({ page, limit, search, centerId, listType, customerCategory });
+    const result = await service.listAppointmentsbyDiagnosticCenters({ 
+        page, limit, search, centerId, listType, customerCategory,
+        month, year, visitType, status, medicalStatus, qcStatus,
+        dateField, rangeType, fromDate, toDate, centerIds
+    });
     return ApiResponse.paginated(res, result.data, result.pagination);
 }));
 
@@ -414,8 +602,25 @@ router.get('/appointments/Technician', verifyToken, requirePermission('appointme
     const search = req.query.q || '';
     const technicianId = parseInt(req.query.technicianId);
     const customerCategory = req.query.customerCategory || '';
+    
+    // Advanced filtering parameters
+    const month = req.query.month || '';
+    const year = req.query.year || '';
+    const visitType = req.query.visitType || '';
+    const status = req.query.status || '';
+    const medicalStatus = req.query.medicalStatus || '';
+    const qcStatus = req.query.qcStatus || '';
+    const dateField = req.query.dateField || 'created_at';
+    const rangeType = req.query.rangeType || '';
+    const fromDate = req.query.fromDate || '';
+    const toDate = req.query.toDate || '';
+    const centerIds = req.query.centerIds ? req.query.centerIds.split(',').filter(id => id.trim()) : [];
 
-    const result = await service.listAppointmentsByTechnician({ page, limit, search, technicianId, customerCategory });
+    const result = await service.listAppointmentsByTechnician({ 
+        page, limit, search, technicianId, customerCategory,
+        month, year, visitType, status, medicalStatus, qcStatus,
+        dateField, rangeType, fromDate, toDate, centerIds
+    });
     return ApiResponse.paginated(res, result.data, result.pagination);
 }));
 
@@ -433,8 +638,26 @@ router.get('/appointments/qc/pending', verifyToken, requirePermission('appointme
     const sortBy = req.query.sortBy || 'id';
     const sortOrder = req.query.sortOrder || 'DESC';
     const customerCategory = req.query.customerCategory || '';
+    
+    // Advanced filtering parameters
+    const month = req.query.month || '';
+    const year = req.query.year || '';
+    const visitType = req.query.visitType || '';
+    const status = req.query.status || '';
+    const medicalStatus = req.query.medicalStatus || '';
+    const qcStatus = req.query.qcStatus || '';
+    const emailSent = req.query.emailSent || '';
+    const dateField = req.query.dateField || 'created_at';
+    const rangeType = req.query.rangeType || '';
+    const fromDate = req.query.fromDate || '';
+    const toDate = req.query.toDate || '';
+    const centerIds = req.query.centerIds ? req.query.centerIds.split(',').filter(id => id.trim()) : [];
 
-    const result = await service.listQcPendingAppointments({ page, limit, search, sortBy, sortOrder, customerCategory });
+    const result = await service.listQcPendingAppointments({
+        page, limit, search, sortBy, sortOrder, customerCategory,
+        month, year, visitType, status, medicalStatus, qcStatus, emailSent,
+        dateField, rangeType, fromDate, toDate, centerIds
+    });
     return ApiResponse.paginated(res, result.data, result.pagination);
 }));
 
@@ -695,35 +918,6 @@ router.post('/appointments/UpdateIds', verifyToken, validateRequest(appointmentB
 // ============================================================================
 
 
-// Center - Get pending (pushed back) appointments
-router.get('/appointments/center/pending', verifyToken, requirePermission('appointments.view'), asyncHandler(async (req, res) => {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 0;
-    const search = req.query.q || '';
-    const customerCategory = req.query.customerCategory || '';
-    console.log("Decoded USER ->", req.user);
-
-
-    // centerId comes from token (req.user)
-    const centerId = req.user.diagnostic_center_id;
-
-    if (!centerId) {
-        return ApiResponse.error(res, "Center ID missing in token", 400);
-    }
-
-    const result = await service.listCenterPendingAppointments({
-        page,
-        limit,
-        search,
-        centerId,
-        customerCategory
-    });
-
-    return ApiResponse.paginated(res, result.data, result.pagination);
-}));
-
-
-// Center - Get unconfirmed appointments (to be scheduled)
 router.get('/appointments/center/unconfirmed', verifyToken, requirePermission('appointments.view'), asyncHandler(async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 0;
@@ -733,11 +927,18 @@ router.get('/appointments/center/unconfirmed', verifyToken, requirePermission('a
     const sortOrder = req.query.sortOrder || 'DESC';
     const customerCategory = req.query.customerCategory || '';
     
-    // Enhanced date filtering parameters
+    // Advanced filtering parameters
+    const month = req.query.month || '';
+    const year = req.query.year || '';
+    const visitType = req.query.visitType || '';
+    const status = req.query.status || 'unconfirmed';
+    const medicalStatus = req.query.medicalStatus || '';
+    const qcStatus = req.query.qcStatus || '';
     const dateField = req.query.dateField || 'created_at';
     const rangeType = req.query.rangeType || '';
     const fromDate = req.query.fromDate || '';
     const toDate = req.query.toDate || '';
+    const centerIds = req.query.centerIds ? req.query.centerIds.split(',').filter(id => id.trim()) : [];
 
     if (!centerId) {
         return ApiResponse.error(res, 'Center ID is required', 400);
@@ -751,19 +952,19 @@ router.get('/appointments/center/unconfirmed', verifyToken, requirePermission('a
         sortBy, 
         sortOrder, 
         customerCategory,
-        month: '', // Legacy - not used in new filtering
-        year: '',  // Legacy - not used in new filtering
-        visitType: '',
-        status: 'unconfirmed', // Apply unconfirmed status filtering
-        medicalStatus: '',
-        qcStatus: '',
+        month, 
+        year, 
+        visitType,
+        status,
+        medicalStatus,
+        qcStatus,
         userId: req.user?.id,
         userRole: req.user?.role_id,
         dateField,
         rangeType,
         fromDate,
         toDate,
-        centerIds: [centerId] // Pass center ID as array for consistent filtering
+        centerIds: centerIds.length > 0 ? centerIds : [centerId] // Use provided centerIds or default to user's center
     });
     
     return ApiResponse.paginated(res, result.data, result.pagination);
@@ -779,11 +980,18 @@ router.get('/appointments/center/confirmed', verifyToken, requirePermission('app
     const sortOrder = req.query.sortOrder || 'DESC';
     const customerCategory = req.query.customerCategory || '';
     
-    // Enhanced date filtering parameters
+    // Advanced filtering parameters
+    const month = req.query.month || '';
+    const year = req.query.year || '';
+    const visitType = req.query.visitType || '';
+    const status = req.query.status || '';
+    const medicalStatus = req.query.medicalStatus || '';
+    const qcStatus = req.query.qcStatus || '';
     const dateField = req.query.dateField || 'created_at';
     const rangeType = req.query.rangeType || '';
     const fromDate = req.query.fromDate || '';
     const toDate = req.query.toDate || '';
+    const centerIds = req.query.centerIds ? req.query.centerIds.split(',').filter(id => id.trim()) : [];
 
     if (!centerId) {
         return ApiResponse.error(res, 'Center ID is required', 400);
@@ -797,21 +1005,21 @@ router.get('/appointments/center/confirmed', verifyToken, requirePermission('app
         sortBy, 
         sortOrder, 
         customerCategory,
-        month: '', // Legacy - not used in new filtering
-        year: '',  // Legacy - not used in new filtering
-        visitType: '',
-        status: '', // Don't use simple status filter for confirmed
-        medicalStatus: 'confirmed,scheduled', // Use medical_status filter to match dashboard
-        qcStatus: '',
+        month, 
+        year, 
+        visitType,
+        status,
+        medicalStatus,
+        qcStatus,
         userId: req.user?.id,
         userRole: req.user?.role_id,
         dateField,
         rangeType,
         fromDate,
         toDate,
-        centerIds: [centerId] // Pass center ID as array for consistent filtering
+        centerIds: centerIds.length > 0 ? centerIds : [centerId], // Use provided centerIds or default to user's center
+        listType: medicalStatus ? 'all' : 'confirmed-scheduled'
     });
-    
     return ApiResponse.paginated(res, result.data, result.pagination);
 }));
 
@@ -823,6 +1031,12 @@ router.get('/appointments/center/report', verifyToken, requirePermission('appoin
     const sortBy = req.query.sortBy || 'id';
     const sortOrder = req.query.sortOrder || 'DESC';
     const customerCategory = req.query.customerCategory || '';
+    const qcStatus = req.query.qcStatus || '';
+    const visitType = req.query.visitType || '';
+    const status = req.query.status || '';
+    const medicalStatus = req.query.medicalStatus || '';
+    const month = req.query.month || '';
+    const year = req.query.year || '';
     
     // Enhanced date filtering parameters
     const dateField = req.query.dateField || 'created_at';
@@ -837,26 +1051,27 @@ router.get('/appointments/center/report', verifyToken, requirePermission('appoin
 
     if (isAdmin) {
         // Admin/Super Admin: fetch all completed appointments without center filtering
-        const result = await service.listAppointments({ 
-            page, 
-            limit, 
-            search, 
-            sortBy, 
-            sortOrder, 
+        const result = await service.listAppointments({
+            page,
+            limit,
+            search,
+            sortBy,
+            sortOrder,
             customerCategory,
-            month: '', // Legacy - not used in new filtering
-            year: '',  // Legacy - not used in new filtering
-            visitType: '',
-            status: '', // Apply completed status filtering
-            medicalStatus: 'completed', // Apply medical completed status filtering
-            qcStatus: '',
+            month,
+            year,
+            visitType,
+            status,
+            medicalStatus,
+            qcStatus,
             userId: req.user?.id,
             userRole: req.user?.role_id,
             dateField,
             rangeType,
             fromDate,
             toDate,
-            centerIds: [] // No center filtering for admin
+            centerIds: [], // No center filtering for admin
+            listType: 'report-upload' // Protected: enforces medical completed only
         });
         return ApiResponse.paginated(res, result.data, result.pagination);
     }
@@ -867,26 +1082,27 @@ router.get('/appointments/center/report', verifyToken, requirePermission('appoin
 
     if (centerId) {
         // Use main listAppointments method with center filtering for consistent date filtering
-        const result = await service.listAppointments({ 
-            page, 
-            limit, 
-            search, 
-            sortBy, 
-            sortOrder, 
+        const result = await service.listAppointments({
+            page,
+            limit,
+            search,
+            sortBy,
+            sortOrder,
             customerCategory,
-            month: '', // Legacy - not used in new filtering
-            year: '',  // Legacy - not used in new filtering
-            visitType: '',
-            status: '', // Apply completed status filtering
-            medicalStatus: 'completed', // Apply medical completed status filtering
-            qcStatus: '',
+            month,
+            year,
+            visitType,
+            status,
+            medicalStatus,
+            qcStatus,
             userId: req.user?.id,
             userRole: req.user?.role_id,
             dateField,
             rangeType,
             fromDate,
             toDate,
-            centerIds: [centerId] // Pass center ID as array for consistent filtering
+            centerIds: [centerId], // Pass center ID as array for consistent filtering
+            listType: 'report-upload' // Protected: enforces medical completed only
         });
         return ApiResponse.paginated(res, result.data, result.pagination);
     }
@@ -929,7 +1145,43 @@ router.patch('/appointments/:id/confirm-schedule',
             req.user.id,
             actorContext
         );
-        return ApiResponse.success(res, result);
+
+        // Trigger TPA webhook for schedule confirmation
+        let webhookStatus = {
+            sent: false,
+            message: '',
+            error: null
+        };
+
+        if (result && process.env.TPA_INTEGRATION_ENABLED === 'true') {
+            try {
+                await triggerAppointmentConfirmed(req.params.id);
+                
+                webhookStatus.sent = true;
+                webhookStatus.message = 'TPA webhook sent successfully';
+                
+                logger.info('TPA webhook triggered for schedule confirmation', { 
+                    appointmentId: req.params.id
+                });
+            } catch (webhookError) {
+                webhookStatus.sent = false;
+                webhookStatus.message = 'TPA webhook failed';
+                webhookStatus.error = webhookError.message;
+                
+                logger.error('Failed to trigger TPA webhook for schedule confirmation', { 
+                    appointmentId: req.params.id,
+                    error: webhookError.message 
+                });
+                // Don't fail the request if webhook fails
+            }
+        } else {
+            webhookStatus.message = 'TPA integration disabled';
+        }
+
+        return ApiResponse.success(res, {
+            ...result,
+            webhook_status: webhookStatus
+        });
     })
 );
 
@@ -981,7 +1233,42 @@ router.patch('/appointments/:id/reschedule',
             actorContext
         );
 
-        return ApiResponse.success(res, result, 'Appointment rescheduled successfully');
+        // Trigger TPA webhook for reschedule
+        let webhookStatus = {
+            sent: false,
+            message: '',
+            error: null
+        };
+
+        if (result && process.env.TPA_INTEGRATION_ENABLED === 'true') {
+            try {
+                await triggerAppointmentRescheduled(appointmentId);
+                
+                webhookStatus.sent = true;
+                webhookStatus.message = 'TPA webhook sent successfully';
+                
+                logger.info('TPA webhook triggered for appointment reschedule', { 
+                    appointmentId
+                });
+            } catch (webhookError) {
+                webhookStatus.sent = false;
+                webhookStatus.message = 'TPA webhook failed';
+                webhookStatus.error = webhookError.message;
+                
+                logger.error('Failed to trigger TPA webhook for appointment reschedule', { 
+                    appointmentId,
+                    error: webhookError.message 
+                });
+                // Don't fail the request if webhook fails
+            }
+        } else {
+            webhookStatus.message = 'TPA integration disabled';
+        }
+
+        return ApiResponse.success(res, {
+            ...result,
+            webhook_status: webhookStatus
+        }, 'Appointment rescheduled successfully');
     })
 );
 
@@ -1028,7 +1315,7 @@ router.patch('/appointments/:id/medical-status',
                 centerId: centerId,
                 type: 'center'
             };
-        }
+        }      
         
         // For Both appointments, require explicit context
         if (!actorContext) {
@@ -1075,12 +1362,58 @@ router.patch('/appointments/:id/medical-status',
             // Fetch and return completion status for 'Both' appointments
             const completionStatus = await service.getAppointmentCompletionStatus(appointmentId);
 
+            // Trigger TPA webhook for medical completion
+            let webhookStatus = {
+                sent: false,
+                message: '',
+                error: null
+            };
+
+            if (result && process.env.TPA_INTEGRATION_ENABLED === 'true') {
+                try {
+                    // Get the updated appointment data
+                    const updatedAppointment = await service.getAppointmentWithTests(appointmentId);
+                    
+                    // Fetch images and documents for medical completion
+                    let completionData = {};
+                    if (medical_status === 'completed') {
+                        completionData = await fetchArrivalData(appointmentId);
+                    }
+                    
+                    // Trigger specific webhook event
+                    const wasWebhookTriggered = await triggerMedicalStatusUpdate(appointmentId, 'completed', actorContext, completionData);
+
+                    webhookStatus.sent = !!wasWebhookTriggered;
+                    webhookStatus.message = wasWebhookTriggered
+                        ? 'TPA webhook sent successfully'
+                        : 'TPA webhook skipped (unsupported status mapping)';
+                    
+                    logger.info('TPA webhook triggered for medical completion', { 
+                        appointmentId,
+                        case_number: updatedAppointment.case_number 
+                    });
+                } catch (webhookError) {
+                    webhookStatus.sent = false;
+                    webhookStatus.message = 'TPA webhook failed';
+                    webhookStatus.error = webhookError.message;
+                    
+                    logger.error('Failed to trigger TPA webhook for medical completion', { 
+                        appointmentId,
+                        error: webhookError.message 
+                    });
+                    // Don't fail the request if webhook fails
+                }
+            } else {
+                webhookStatus.message = 'TPA integration disabled';
+            }
+
             return ApiResponse.success(res, {
                 ...result,
-                completion_status: completionStatus
+                completion_status: completionStatus,
+                webhook_status: webhookStatus
             });
         }
-
+      
         // Normal path for other statuses (arrived / in_process / partially_completed)
         const result = await service.updateMedicalStatus(
             appointmentId,
@@ -1098,9 +1431,57 @@ router.patch('/appointments/:id/medical-status',
         // Fetch and return completion status for 'Both' appointments
         const completionStatus = await service.getAppointmentCompletionStatus(appointmentId);
 
+        // Trigger TPA webhook for medical status change
+        let webhookStatus = {
+            sent: false,
+            message: '',
+            error: null
+        };
+
+        if (result && process.env.TPA_INTEGRATION_ENABLED === 'true') {
+            try {
+                // Prepare additional data for arrival status
+                let additionalData = {};
+                if (medical_status === 'arrived') {
+                    // Fetch customer images and documents for arrival
+                    additionalData = await fetchArrivalData(appointmentId);
+                }
+                
+                // Trigger webhook with actor context
+                const wasWebhookTriggered = await triggerMedicalStatusUpdate(appointmentId, medical_status, actorContext, additionalData);
+
+                webhookStatus.sent = !!wasWebhookTriggered;
+                webhookStatus.message = wasWebhookTriggered
+                    ? 'TPA webhook sent successfully'
+                    : 'TPA webhook skipped (unsupported status mapping)';
+                
+                logger.info('TPA webhook triggered for medical status update', { 
+                    appointmentId,
+                    medical_status,
+                    actorContext: actorContext?.type,
+                    hasImages: additionalData.customer_images?.length || 0,
+                    hasDocuments: additionalData.documents?.length || 0
+                });
+            } catch (webhookError) {
+                webhookStatus.sent = false;
+                webhookStatus.message = 'TPA webhook failed';
+                webhookStatus.error = webhookError.message;
+                
+                logger.error('Failed to trigger TPA webhook for medical status update', { 
+                    appointmentId,
+                    medical_status,
+                    error: webhookError.message 
+                });
+                // Don't fail the request if webhook fails
+            }
+        } else {
+            webhookStatus.message = 'TPA integration disabled';
+        }
+
         return ApiResponse.success(res, {
             ...result,
-            completion_status: completionStatus
+            completion_status: completionStatus,
+            webhook_status: webhookStatus
         });
     })
 );
@@ -1175,7 +1556,43 @@ router.post('/appointments/:id/push-back',
             req.user.id,
             actorContext
         );
-        return ApiResponse.success(res, result);
+
+        // Trigger TPA webhook for push-back (cancelled)
+        let webhookStatus = {
+            sent: false,
+            message: '',
+            error: null
+        };
+
+        if (result && process.env.TPA_INTEGRATION_ENABLED === 'true') {
+            try {
+                await triggerAppointmentCancelled(req.params.id);
+                
+                webhookStatus.sent = true;
+                webhookStatus.message = 'TPA webhook sent successfully';
+                
+                logger.info('[TPA-WH] Triggered for cancellation/push-back', { 
+                    appointmentId: req.params.id
+                });
+            } catch (webhookError) {
+                webhookStatus.sent = false;
+                webhookStatus.message = 'TPA webhook failed';
+                webhookStatus.error = webhookError.message;
+                
+                logger.error('[TPA-WH] Failed for cancellation/push-back', { 
+                    appointmentId: req.params.id,
+                    error: webhookError.message 
+                });
+                // Don't fail the request if webhook fails
+            }
+        } else {
+            webhookStatus.message = 'TPA integration disabled';
+        }
+
+        return ApiResponse.success(res, {
+            ...result,
+            webhook_status: webhookStatus
+        });
     })
 );
 
@@ -1409,7 +1826,7 @@ router.post('/appointments/:id/documents',
         }
 
         const docSubfolder = path.join('appointment_documents', `appointment_${appointmentId}`, `user_${req.user.id}`);
-        // const filePath = await processSingleFile(req.file, docSubfolder);
+        // Skip compression for web uploads to preserve original quality
         const filePath = await processSingleFile(req.file, docSubfolder, '', true);
         const fileName = req.file.originalname;
 
@@ -1421,6 +1838,9 @@ router.post('/appointments/:id/documents',
             fileName,
             req.user.id
         );
+
+        // Trigger enhanced webhook immediately if patient has arrived
+        triggerEnhancedWebhookNow(appointmentId);
 
         return ApiResponse.success(res, result);
     })
@@ -1445,7 +1865,7 @@ router.post('/appointments/:id/customer-images',
         const imageSubfolder = caseNo
             ? path.join('appointment_customer_images', caseNo)
             : path.join('appointment_customer_images', `appointment_${appointmentId}`);
-        // const filePath = await processSingleFile(req.file, imageSubfolder);
+        // Skip compression for web uploads to preserve original quality
         const filePath = await processSingleFile(req.file, imageSubfolder, '', true);
         const fileName = req.file.originalname;
 
@@ -1456,6 +1876,9 @@ router.post('/appointments/:id/customer-images',
             fileName,
             req.user.id
         );
+
+        // Trigger enhanced webhook immediately if patient has arrived
+        triggerEnhancedWebhookNow(appointmentId);
 
         return ApiResponse.success(res, result);
     })
@@ -1600,12 +2023,7 @@ router.get('/appointments/:id/categorized-reports',
             }
         }
         
-        // DEBUG: Log user object to understand structure
-        console.log('User Object Debug:', JSON.stringify(req.user, null, 2));
-        console.log('Extracted Values:', { centerId, userId, userRole });
-        
         const reports = await service.getCategorizedReports(appointmentId, centerId, userId, userRole);
-        console.log('Reports returned:', JSON.stringify(reports, null, 2));
         return ApiResponse.success(res, reports);
     })
 );

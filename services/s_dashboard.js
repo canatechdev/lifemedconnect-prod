@@ -1,5 +1,7 @@
 const db = require('../lib/dbconnection');
 const logger = require('../lib/logger');
+const { getStatusConditions, getAppointmentListDefinition } = require('./appointments/AppointmentFilterHelper');
+const { hasPermission } = require('../lib/permissions');
 
 class DashboardService {
   /**
@@ -139,7 +141,7 @@ class DashboardService {
    * Build dynamic WHERE clause fragments and params based on user role/context
    */
   buildRoleFilter(user) {
-    const where = ['is_deleted = 0'];
+    const where = ['is_deleted = 0', 'has_pending_approval = 0'];
     const params = [];
 
     // Center user filtering - consistent with appointments list logic
@@ -170,7 +172,14 @@ class DashboardService {
   async getDashboardStats(user) {
     const { whereSql, params } = this.buildRoleFilter(user);
 
-    const baseWhere = whereSql ? `${whereSql}` : 'WHERE is_deleted = 0';
+    const baseWhere = whereSql ? `${whereSql}` : 'WHERE is_deleted = 0 AND has_pending_approval = 0';
+    const hasQcAccess = hasPermission(user?.permissions || [], 'appointments.qc');
+    const confirmedScheduledDefinition = user?.diagnostic_center_id
+      ? getAppointmentListDefinition('confirmed-scheduled', 'appointments')
+      : { conditions: getStatusConditions('confirmed', 'appointments'), params: [] };
+    const qcPendingDefinition = hasQcAccess
+      ? { conditions: getStatusConditions('qc_pending', 'appointments'), params: [] }
+      : getAppointmentListDefinition('report-upload', 'appointments');
 
     const monthFilters = {
       current: 'YEAR(appointment_date) = YEAR(CURDATE()) AND MONTH(appointment_date) = MONTH(CURDATE())',
@@ -181,12 +190,14 @@ class DashboardService {
       { key: 'totalAppointments', condition: '1=1', dateExpr: 'appointment_date' },
       {
         key: 'confirmedScheduled',
-        condition: "medical_status IN ('confirmed','scheduled')",
+        condition: confirmedScheduledDefinition.conditions.join(' AND '),
+        params: confirmedScheduledDefinition.params,
         dateExpr: 'COALESCE(home_confirmed_at, center_confirmed_at, confirmed_date, appointment_date)'
       },
       {
         key: 'qcPending',
-        condition: "qc_status <> 'completed'",
+        condition: qcPendingDefinition.conditions.join(' AND '),
+        params: qcPendingDefinition.params,
         dateExpr: 'appointment_date'
       },
       {
@@ -197,6 +208,15 @@ class DashboardService {
       {
         key: 'today',
         condition: '1=1',
+        dateExpr: 'appointment_date'
+      },
+      {
+        key: 'todayMedicalDone',
+        condition: `(
+          medical_status IN ('completed', 'complete')
+          OR center_medical_status IN ('completed', 'complete')
+          OR home_medical_status IN ('completed', 'complete')
+        )`,
         dateExpr: 'appointment_date'
       },
       {
@@ -218,9 +238,10 @@ class DashboardService {
       let sql, total, currentMonth, previousMonth;
       
       // Special handling for date-based buckets - use same logic as appointments list
-      if (['today', 'tomorrow', 'upcoming'].includes(bucket.key)) {
+      if (['today', 'todayMedicalDone', 'tomorrow', 'upcoming'].includes(bucket.key)) {
         switch (bucket.key) {
           case 'today':
+          case 'todayMedicalDone':
             // For appointment_date, use timezone-aware logic like appointments list
             if (dateExpr === 'appointment_date') {
               sql = `
@@ -297,7 +318,7 @@ class DashboardService {
         `;
       }
 
-      const [row] = await db.query(sql, params);
+      const [row] = await db.query(sql, [...params, ...(bucket.params || [])]);
       total = Number(row.totalCount) || 0;
       currentMonth = Number(row.currentMonthCount) || 0;
       previousMonth = Number(row.prevMonthCount) || 0;
@@ -325,6 +346,7 @@ class DashboardService {
       const { whereSql, params } = this.buildRoleFilter(user);
       const aliasReplace = (clause) => clause
         .replace(/\bis_deleted\b/g, 'a.is_deleted')
+        .replace(/\bhas_pending_approval\b/g, 'a.has_pending_approval')
         .replace(/\bcenter_id\b/g, 'a.center_id')
         .replace(/\bother_center_id\b/g, 'a.other_center_id')
         .replace(/\binsurer_id\b/g, 'a.insurer_id')

@@ -93,7 +93,8 @@ async function getTpaEmailLogs(appointmentId) {
                 c.client_name,
                 c.client_code,
                 c.email_id as client_email,
-                c.email_id_2 as client_email_2
+                c.email_id_2 as client_email_2,
+                c.email_id_3 as client_email_3
             FROM tpa_email_log tel
             JOIN users u ON tel.sent_by = u.id
             LEFT JOIN clients c ON tel.client_id = c.id
