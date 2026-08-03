@@ -186,6 +186,7 @@ const smartReportRoutes = require('./routes/r_smart_reports');
 const appointmentLifecycleRoutes = require('./routes/r_appointment_lifecycle');
 const tpaRoutes = require('./routes/r_tpa');
 const tpaManagementRoutes = require('./routes/r_tpa_management');
+const storageBackupRoutes = require('./routes/r_storage_backup');
 
 // Health check route
 app.get('/', (req, res) => {
@@ -256,6 +257,7 @@ app.use('/api/smart-reports', smartReportRoutes);
 app.use('/api/appointment-lifecycle', appointmentLifecycleRoutes);
 app.use('/api/tpa', tpaRoutes);
 app.use('/api/tpa-management', tpaManagementRoutes);
+app.use('/api', storageBackupRoutes);
 
 // SPA Fallback: Serve index.html for all non-API routes (production only)
 // This allows React Router to handle client-side routing

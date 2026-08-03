@@ -482,7 +482,9 @@ async function pushBackAppointment(appointmentId, remarks, userId, actorContext 
                 throw new Error('Both appointments require actorContext to push back per side');
             }
 
-            const side = actorContext.type === 'center' ? 'center' : 'home';
+            const side = ['center', 'home'].includes(actorContext.side)
+                ? actorContext.side
+                : (actorContext.type === 'center' ? 'center' : 'home');
             const centerPushed = side === 'center' ? 1 : (current[0].center_pushed_back || 0);
             const homePushed = side === 'home' ? 1 : (current[0].home_pushed_back || 0);
 

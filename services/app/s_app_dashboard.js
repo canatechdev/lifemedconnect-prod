@@ -38,9 +38,9 @@ async function getTechnicianDashboardCounts(userId) {
             ? `CASE
                  WHEN LOWER(a.visit_type) = 'both' AND a.center_id = ${cid} THEN (a.center_pushed_back = 0 OR a.center_pushed_back IS NULL)
                  WHEN LOWER(a.visit_type) = 'both' AND a.other_center_id = ${cid} THEN (a.home_pushed_back = 0 OR a.home_pushed_back IS NULL)
-                 ELSE (a.center_pushed_back = 0 OR a.center_pushed_back IS NULL)
+                 ELSE ((a.pushed_back = 0 OR a.pushed_back IS NULL) AND (a.status IS NULL OR a.status != 'pushed_back'))
                END`
-            : `(a.pushed_back = 0 OR a.pushed_back IS NULL) AND a.status != 'pushed_back'`;
+            : `(a.pushed_back = 0 OR a.pushed_back IS NULL) AND (a.status IS NULL OR a.status != 'pushed_back')`;
 
         const scopeJoin = isCenter
             ? `FROM appointments a`

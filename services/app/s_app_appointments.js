@@ -73,6 +73,18 @@ function applyExtraFilters(conditions, params, { fromDate, toDate, visitType }, 
     }
 }
 
+function getPushedBackVisibilityExpr(isCenter, centerId = null) {
+    if (!isCenter) {
+        return `(a.pushed_back = 0 OR a.pushed_back IS NULL) AND (a.status IS NULL OR a.status != 'pushed_back')`;
+    }
+
+    return `CASE
+             WHEN LOWER(a.visit_type) = 'both' AND a.center_id = ${centerId} THEN (a.center_pushed_back = 0 OR a.center_pushed_back IS NULL)
+             WHEN LOWER(a.visit_type) = 'both' AND a.other_center_id = ${centerId} THEN (a.home_pushed_back = 0 OR a.home_pushed_back IS NULL)
+             ELSE ((a.pushed_back = 0 OR a.pushed_back IS NULL) AND (a.status IS NULL OR a.status != 'pushed_back'))
+           END`;
+}
+
 async function listAppointments({ userId, page = 1, limit = 10, search = '', upcomingOnly = false, todayOnly = false, statusGroup = null, fromDate = '', toDate = '', visitType = '' }) {
     const scope = await resolveAppScope(userId);
     if (!scope) {
@@ -128,14 +140,7 @@ async function listAppointments({ userId, page = 1, limit = 10, search = '', upc
            END`
         : `CASE WHEN LOWER(a.visit_type) = 'both' THEN a.home_medical_status ELSE a.medical_status END`;
 
-    // Pushed-back expression
-    const pushedBackExpr = isCenter
-        ? `CASE
-             WHEN LOWER(a.visit_type) = 'both' AND a.center_id = ${cid} THEN (a.center_pushed_back = 0 OR a.center_pushed_back IS NULL)
-             WHEN LOWER(a.visit_type) = 'both' AND a.other_center_id = ${cid} THEN (a.home_pushed_back = 0 OR a.home_pushed_back IS NULL)
-             ELSE (a.center_pushed_back = 0 OR a.center_pushed_back IS NULL)
-           END`
-        : null;
+    const pushedBackVisibilityExpr = getPushedBackVisibilityExpr(isCenter, cid);
 
     if (todayOnly) {
         conditions.push(`DATE(CONVERT_TZ(${confirmDateExpr}, '+00:00', '+05:30')) = DATE(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+05:30'))`);
@@ -157,13 +162,8 @@ async function listAppointments({ userId, page = 1, limit = 10, search = '', upc
 
     conditions.push('a.is_deleted = 0');
     conditions.push(`${confirmDateExpr} IS NOT NULL`);
-    // Exclude pushed back appointments
-    if (isCenter) {
-        conditions.push(pushedBackExpr);
-    } else {
-        conditions.push('(a.pushed_back = 0 OR a.pushed_back IS NULL)');
-        conditions.push('a.status != "pushed_back"');
-    }
+    // Exclude appointments pushed back for this app user's active scope.
+    conditions.push(`(${pushedBackVisibilityExpr})`);
 
     // Extra filters: fromDate, toDate, visitType
     applyExtraFilters(conditions, searchParams, { fromDate, toDate, visitType }, confirmDateExpr);
@@ -359,6 +359,7 @@ async function getAppointmentDetails({ userId, appointmentId }) {
     const ownershipWhere = isCenter
         ? `(a.center_id = ${cid} OR a.other_center_id = ${cid})`
         : `1=1`; // already scoped by join
+    const pushedBackVisibilityExpr = getPushedBackVisibilityExpr(isCenter, cid);
 
     const rows = await db.query(
         `SELECT
@@ -433,6 +434,7 @@ async function getAppointmentDetails({ userId, appointmentId }) {
         LEFT JOIN clients c ON a.client_id = c.id
         LEFT JOIN insurers i ON a.insurer_id = i.id
         WHERE a.id = ? AND a.is_deleted = 0 AND ${ownershipWhere}
+          AND (${pushedBackVisibilityExpr})
         LIMIT 1`,
         [appointmentId]
     );
@@ -466,7 +468,7 @@ async function getAppScopeForAppointment(appointmentId, userId) {
         }
 
         const row = rows[0];
-        const side = row.center_id === scope.centerId ? 'center' : 'home';
+        const side = Number(row.center_id) === Number(scope.centerId) ? 'center' : 'home';
         const actorContext = { type: 'center', centerId: scope.centerId, side, visitType: row.visit_type };
         return { scope, actorContext, owns: true };
     } else {
