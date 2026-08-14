@@ -48,7 +48,7 @@ router.post('/storage-backup/backup-zip', verifyToken, async (req, res) => {
             req.body.appointment_ids,
             req.body.remark
         );
-        return ApiResponse.success(res, job, 'Backup ZIP generated successfully', 201);
+        return ApiResponse.success(res, job, 'Backup ZIP queued successfully', 202);
     } catch (error) {
         logger.error('Storage backup ZIP failed', { error: error.message, userId: req.user?.id });
         return handleRouteError(res, error);
@@ -62,7 +62,7 @@ router.post('/storage-backup/tpa-pdf-zip', verifyToken, async (req, res) => {
             req.body.appointment_ids,
             req.body.remark
         );
-        return ApiResponse.success(res, job, 'TPA PDF ZIP generated successfully', 201);
+        return ApiResponse.success(res, job, 'TPA PDF ZIP queued successfully', 202);
     } catch (error) {
         logger.error('Storage TPA PDF ZIP failed', { error: error.message, userId: req.user?.id });
         return handleRouteError(res, error);
@@ -105,7 +105,7 @@ router.delete('/storage-backup/appointments/files', verifyToken, async (req, res
             req.body.appointment_ids,
             req.body.remark
         );
-        return ApiResponse.success(res, result, 'Appointment files deleted successfully');
+        return ApiResponse.success(res, result, 'Appointment file cleanup queued successfully', 202);
     } catch (error) {
         logger.error('Storage appointment cleanup failed', { error: error.message, userId: req.user?.id });
         return handleRouteError(res, error);
@@ -119,7 +119,7 @@ router.delete('/storage-backup/orphans', verifyToken, async (req, res) => {
             req.body.file_paths,
             req.body.remark
         );
-        return ApiResponse.success(res, result, 'Orphan files deleted successfully');
+        return ApiResponse.success(res, result, 'Orphan cleanup queued successfully', 202);
     } catch (error) {
         logger.error('Storage orphan cleanup failed', { error: error.message, userId: req.user?.id });
         return handleRouteError(res, error);

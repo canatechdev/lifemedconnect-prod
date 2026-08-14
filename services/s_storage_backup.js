@@ -16,6 +16,15 @@ const MAX_SIMPLE_ZIP_BYTES = Math.min(
     Number(process.env.STORAGE_MAX_ZIP_GB || 3.8) * 1024 * 1024 * 1024,
     0xffffffff - 1024 * 1024
 );
+const STORAGE_JOB_CONCURRENCY = Math.max(1, Number(process.env.STORAGE_JOB_CONCURRENCY || 1));
+const STORAGE_JOB_SCAN_LIMIT = Math.max(10, Number(process.env.STORAGE_JOB_SCAN_LIMIT || 15));
+
+const TERMINAL_JOB_STATUSES = new Set(['ready', 'completed', 'failed', 'expired', 'manual_deleted']);
+const ACTIVE_JOB_STATUSES = ['queued', 'processing', 'ready'];
+
+const storageJobQueue = [];
+let runningStorageJobs = 0;
+let storageJobsRecovered = false;
 
 function assertSuperAdmin(user) {
     if (!user || Number(user.role_id) !== SUPER_ADMIN_ROLE_ID) {
@@ -27,6 +36,19 @@ function assertSuperAdmin(user) {
 
 function bytesToGb(bytes) {
     return Number((Number(bytes || 0) / (1024 * 1024 * 1024)).toFixed(2));
+}
+
+function safeJsonParse(value, fallback) {
+    if (!value) return fallback;
+    try {
+        return JSON.parse(value);
+    } catch (_) {
+        return fallback;
+    }
+}
+
+function delayImmediate() {
+    return new Promise((resolve) => setImmediate(resolve));
 }
 
 function toArray(value) {
@@ -201,8 +223,119 @@ async function logAudit(req, action, payload = {}) {
     );
 }
 
+async function logJobAudit(job, action, payload = {}) {
+    await db.query(
+        `INSERT INTO storage_backup_activity
+         (action, related_job_id, appointment_ids_json, file_paths_json, total_files, total_size, remark, performed_by, ip_address, user_agent, metadata_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+            action,
+            job.id,
+            JSON.stringify(payload.appointmentIds || safeJsonParse(job.appointment_ids_json, [])),
+            JSON.stringify(payload.filePaths || []),
+            payload.totalFiles || 0,
+            payload.totalSize || 0,
+            payload.remark || job.remark || null,
+            job.performed_by || null,
+            job.ip_address || null,
+            String(job.user_agent || '').slice(0, 500),
+            JSON.stringify(payload.metadata || {}),
+        ]
+    );
+}
+
+function formatJobRow(row) {
+    const metadata = safeJsonParse(row.metadata_json, {});
+    return {
+        id: Number(row.id),
+        action: row.action || null,
+        job_type: row.job_type || null,
+        status: row.status || null,
+        file_name: row.file_name || null,
+        file_path: row.file_path || null,
+        total_files: Number(row.total_files || 0),
+        total_size: Number(row.total_size || 0),
+        created_at: row.created_at || null,
+        expires_at: row.expires_at || null,
+        downloaded_at: row.downloaded_at || null,
+        deleted_at: row.deleted_at || null,
+        error_message: row.error_message || metadata.error_message || null,
+        progress_percent: Number(metadata.progress_percent || 0),
+        progress_message: metadata.progress_message || null,
+        progress_current: Number(metadata.progress_current || 0),
+        progress_total: Number(metadata.progress_total || 0),
+        metadata,
+    };
+}
+
+async function updateJobRow(jobId, updates = {}) {
+    const fields = [];
+    const values = [];
+    Object.entries(updates).forEach(([key, value]) => {
+        fields.push(`${key} = ?`);
+        values.push(value);
+    });
+    if (!fields.length) return;
+    values.push(jobId);
+    await db.query(`UPDATE storage_backup_activity SET ${fields.join(', ')} WHERE id = ?`, values);
+}
+
+async function markQueuedJobsFailedOnce() {
+    if (storageJobsRecovered) return;
+    storageJobsRecovered = true;
+    await db.query(
+        `UPDATE storage_backup_activity
+         SET status = 'failed',
+             error_message = COALESCE(error_message, 'Storage job interrupted before completion')
+         WHERE job_type IS NOT NULL
+           AND status IN ('queued', 'processing')`
+    );
+}
+
+async function fetchJob(jobId) {
+    const rows = await db.query(`SELECT * FROM storage_backup_activity WHERE id = ? LIMIT 1`, [jobId]);
+    return rows[0] || null;
+}
+
+async function persistJobProgress(jobId, metadata = {}, extraUpdates = {}) {
+    await updateJobRow(jobId, {
+        metadata_json: JSON.stringify(metadata),
+        ...extraUpdates,
+    });
+}
+
+function enqueueStorageJob(jobId, worker) {
+    storageJobQueue.push({ jobId, worker });
+    setImmediate(() => {
+        runStorageJobQueue().catch((error) => {
+            logger.error('Storage job queue failed', { error: error.message });
+        });
+    });
+}
+
+async function runStorageJobQueue() {
+    if (runningStorageJobs >= STORAGE_JOB_CONCURRENCY) return;
+    const next = storageJobQueue.shift();
+    if (!next) return;
+
+    runningStorageJobs += 1;
+    try {
+        await next.worker();
+    } finally {
+        runningStorageJobs -= 1;
+        if (storageJobQueue.length) {
+            setImmediate(() => {
+                runStorageJobQueue().catch((error) => {
+                    logger.error('Storage job queue failed', { error: error.message });
+                });
+            });
+        }
+    }
+}
+
 async function getSummary(req) {
     assertSuperAdmin(req.user);
+    await markQueuedJobsFailedOnce();
     await cleanupExpiredZips();
 
     const [uploadsBytes, zipBytes] = await Promise.all([
@@ -216,11 +349,17 @@ async function getSummary(req) {
     const level = uploadsBytes >= dangerBytes ? 'danger' : uploadsBytes >= warningBytes ? 'warning' : 'ok';
 
     const activeJobs = await db.query(
-        `SELECT id, job_type, status, file_name, total_files, total_size, created_at, expires_at
+        `SELECT id, action, job_type, status, file_name, file_path, total_files, total_size,
+                created_at, expires_at, downloaded_at, deleted_at, error_message, metadata_json
          FROM storage_backup_activity
-         WHERE status = 'ready' AND (expires_at IS NULL OR expires_at > NOW())
+         WHERE job_type IS NOT NULL
+           AND (
+                status IN ('queued', 'processing', 'completed', 'failed')
+                OR (status = 'ready' AND (expires_at IS NULL OR expires_at > NOW()))
+           )
          ORDER BY created_at DESC
-         LIMIT 10`
+         LIMIT ?`,
+        [STORAGE_JOB_SCAN_LIMIT]
     );
 
     return {
@@ -236,7 +375,7 @@ async function getSummary(req) {
             bytes: zipBytes,
             gb: bytesToGb(zipBytes),
             retention_hours: ZIP_RETENTION_HOURS,
-            active_jobs: activeJobs,
+            active_jobs: activeJobs.map(formatJobRow),
         },
         limits: {
             max_zip_bytes: Math.floor(MAX_SIMPLE_ZIP_BYTES),
@@ -442,8 +581,7 @@ async function getBackupCoverage(appointmentIds = []) {
     return covered;
 }
 
-async function previewAppointments(req, appointmentIds) {
-    assertSuperAdmin(req.user);
+async function previewAppointmentsInternal(appointmentIds, auditReq = null) {
     const ids = toArray(appointmentIds);
     if (!ids.length) {
         const error = new Error('Select at least one appointment');
@@ -486,12 +624,14 @@ async function previewAppointments(req, appointmentIds) {
         });
     }
 
-    await logAudit(req, 'preview_cases', {
-        appointmentIds: ids,
-        totalFiles,
-        totalSize,
-        metadata: { missingFiles },
-    });
+    if (auditReq) {
+        await logAudit(auditReq, 'preview_cases', {
+            appointmentIds: ids,
+            totalFiles,
+            totalSize,
+            metadata: { missingFiles },
+        });
+    }
 
     return {
         appointments: items,
@@ -506,6 +646,11 @@ async function previewAppointments(req, appointmentIds) {
             max_zip_gb: bytesToGb(MAX_SIMPLE_ZIP_BYTES),
         },
     };
+}
+
+async function previewAppointments(req, appointmentIds) {
+    assertSuperAdmin(req.user);
+    return previewAppointmentsInternal(appointmentIds, req);
 }
 
 async function getReferencedUploadPaths() {
@@ -604,20 +749,8 @@ async function scanOrphanFiles(req, params = {}) {
     };
 }
 
-async function deleteAppointmentFiles(req, appointmentIds, remark) {
-    assertSuperAdmin(req.user);
-    if (!String(remark || '').trim()) {
-        const error = new Error('Delete remark is required');
-        error.statusCode = 400;
-        throw error;
-    }
-    const ids = toArray(appointmentIds);
-    if (!ids.length) {
-        const error = new Error('Select at least one appointment');
-        error.statusCode = 400;
-        throw error;
-    }
-
+async function processAppointmentDeleteJob(job, updateProgress) {
+    const ids = toArray(safeJsonParse(job.appointment_ids_json, []));
     const placeholders = ids.map(() => '?').join(',');
     const appointments = await db.query(
         `SELECT id, case_number, status, qc_status
@@ -642,68 +775,207 @@ async function deleteAppointmentFiles(req, appointmentIds, remark) {
 
     if (blocked.length) {
         const error = new Error('Some selected appointments are not eligible for cleanup');
-        error.statusCode = 400;
         error.details = blocked;
         throw error;
+    }
+
+    const batch = [];
+    for (const id of ids) {
+        const collected = await collectAppointmentFiles(id);
+        for (const file of collected.files) {
+            batch.push({ appointment_id: id, ...file });
+        }
     }
 
     const deleted = [];
     const skipped = [];
     let totalSize = 0;
+    const totalFiles = batch.length;
+    let processedFiles = 0;
 
-    for (const id of ids) {
-        const collected = await collectAppointmentFiles(id);
-        for (const file of collected.files) {
-            if (!file.exists) {
-                skipped.push({ file_path: file.file_path, reason: 'Missing' });
-                continue;
-            }
+    await updateProgress({
+        progress_percent: 5,
+        progress_message: `Deleting appointment files 0/${totalFiles}`,
+        progress_current: 0,
+        progress_total: totalFiles,
+    });
+
+    for (const file of batch) {
+        processedFiles += 1;
+        if (!file.exists) {
+            skipped.push({ file_path: file.file_path, reason: 'Missing' });
+        } else {
             const absolute = resolveUploadPath(file.file_path);
             if (!absolute) {
                 skipped.push({ file_path: file.file_path, reason: 'Outside uploads folder' });
-                continue;
+            } else {
+                try {
+                    const stat = await fs.promises.stat(absolute);
+                    await fs.promises.unlink(absolute);
+                    deleted.push({
+                        appointment_id: file.appointment_id,
+                        file_path: file.file_path,
+                        category: file.category,
+                        size: stat.size,
+                    });
+                    totalSize += stat.size;
+                } catch (error) {
+                    skipped.push({ file_path: file.file_path, reason: error.message });
+                }
             }
-            try {
-                const stat = await fs.promises.stat(absolute);
-                await fs.promises.unlink(absolute);
-                deleted.push({
-                    appointment_id: id,
-                    file_path: file.file_path,
-                    category: file.category,
-                    size: stat.size,
-                });
-                totalSize += stat.size;
-            } catch (error) {
-                skipped.push({ file_path: file.file_path, reason: error.message });
-            }
+        }
+
+        if (processedFiles === totalFiles || processedFiles % 10 === 0) {
+            await updateProgress({
+                progress_percent: Math.min(100, Math.round((processedFiles / Math.max(totalFiles, 1)) * 100)),
+                progress_message: `Deleting appointment files ${processedFiles}/${totalFiles}`,
+                progress_current: processedFiles,
+                progress_total: totalFiles,
+            });
+            await delayImmediate();
         }
     }
 
-    await logAudit(req, 'appointment_files_deleted', {
+    const completedMetadata = {
+        ...safeJsonParse(job.metadata_json, {}),
+        progress_percent: 100,
+        progress_message: 'Cleanup completed',
+        progress_current: processedFiles,
+        progress_total: totalFiles,
+        skipped,
+        finished_at: new Date().toISOString(),
+    };
+
+    await updateJobRow(job.id, {
+        action: 'appointment_files_deleted',
+        status: 'completed',
+        total_files: deleted.length,
+        total_size: totalSize,
+        metadata_json: JSON.stringify(completedMetadata),
+        error_message: null,
+    });
+
+    await logJobAudit(job, 'appointment_files_deleted', {
         appointmentIds: ids,
         filePaths: deleted.map(file => file.file_path),
         totalFiles: deleted.length,
         totalSize,
-        remark,
+        remark: job.remark,
         metadata: { skipped },
     });
-
-    return {
-        deleted_files: deleted.length,
-        deleted_size: totalSize,
-        deleted_size_gb: bytesToGb(totalSize),
-        skipped_files: skipped.length,
-        skipped,
-    };
 }
 
-async function deleteOrphanFiles(req, filePaths, remark) {
+async function processOrphanDeleteJob(job, updateProgress) {
+    const paths = safeJsonParse(job.file_paths_json, []).map(normalizeDbPath).filter(Boolean);
+    const referenced = await getReferencedUploadPaths();
+    const deleted = [];
+    const skipped = [];
+    let totalSize = 0;
+    const totalFiles = paths.length;
+    let processedFiles = 0;
+
+    await updateProgress({
+        progress_percent: 5,
+        progress_message: `Deleting orphan files 0/${totalFiles}`,
+        progress_current: 0,
+        progress_total: totalFiles,
+    });
+
+    for (const filePath of paths) {
+        processedFiles += 1;
+        if (referenced.has(filePath)) {
+            skipped.push({ file_path: filePath, reason: 'File is linked in database' });
+        } else {
+            const absolute = resolveUploadPath(filePath);
+            if (!absolute) {
+                skipped.push({ file_path: filePath, reason: 'Outside uploads folder' });
+            } else {
+                try {
+                    const stat = await fs.promises.stat(absolute);
+                    if (!stat.isFile()) {
+                        skipped.push({ file_path: filePath, reason: 'Not a file' });
+                    } else {
+                        await fs.promises.unlink(absolute);
+                        deleted.push({ file_path: filePath, size: stat.size });
+                        totalSize += stat.size;
+                    }
+                } catch (error) {
+                    skipped.push({ file_path: filePath, reason: error.message });
+                }
+            }
+        }
+
+        if (processedFiles === totalFiles || processedFiles % 20 === 0) {
+            await updateProgress({
+                progress_percent: Math.min(100, Math.round((processedFiles / Math.max(totalFiles, 1)) * 100)),
+                progress_message: `Deleting orphan files ${processedFiles}/${totalFiles}`,
+                progress_current: processedFiles,
+                progress_total: totalFiles,
+            });
+            await delayImmediate();
+        }
+    }
+
+    const completedMetadata = {
+        ...safeJsonParse(job.metadata_json, {}),
+        progress_percent: 100,
+        progress_message: 'Cleanup completed',
+        progress_current: processedFiles,
+        progress_total: totalFiles,
+        skipped,
+        finished_at: new Date().toISOString(),
+    };
+
+    await updateJobRow(job.id, {
+        action: 'orphan_files_deleted',
+        status: 'completed',
+        total_files: deleted.length,
+        total_size: totalSize,
+        metadata_json: JSON.stringify(completedMetadata),
+        error_message: null,
+    });
+
+    await logJobAudit(job, 'orphan_files_deleted', {
+        filePaths: deleted.map(file => file.file_path),
+        totalFiles: deleted.length,
+        totalSize,
+        remark: job.remark,
+        metadata: { skipped },
+    });
+}
+
+async function deleteAppointmentFiles(req, appointmentIds, remark) {
     assertSuperAdmin(req.user);
+    await markQueuedJobsFailedOnce();
+
     if (!String(remark || '').trim()) {
         const error = new Error('Delete remark is required');
         error.statusCode = 400;
         throw error;
     }
+
+    const ids = toArray(appointmentIds);
+    if (!ids.length) {
+        const error = new Error('Select at least one appointment');
+        error.statusCode = 400;
+        throw error;
+    }
+
+    const job = await insertStorageJob(req, 'appointment_cleanup', 'appointment_cleanup_requested', ids, remark);
+    await processStorageJob(job.id, processAppointmentDeleteJob);
+    return buildStorageJobResponse(job);
+}
+
+async function deleteOrphanFiles(req, filePaths, remark) {
+    assertSuperAdmin(req.user);
+    await markQueuedJobsFailedOnce();
+
+    if (!String(remark || '').trim()) {
+        const error = new Error('Delete remark is required');
+        error.statusCode = 400;
+        throw error;
+    }
+
     const paths = Array.isArray(filePaths) ? filePaths.map(normalizeDbPath).filter(Boolean) : [];
     if (!paths.length) {
         const error = new Error('Select at least one orphan file');
@@ -711,50 +983,9 @@ async function deleteOrphanFiles(req, filePaths, remark) {
         throw error;
     }
 
-    const referenced = await getReferencedUploadPaths();
-    const deleted = [];
-    const skipped = [];
-    let totalSize = 0;
-
-    for (const filePath of paths) {
-        if (referenced.has(filePath)) {
-            skipped.push({ file_path: filePath, reason: 'File is linked in database' });
-            continue;
-        }
-        const absolute = resolveUploadPath(filePath);
-        if (!absolute) {
-            skipped.push({ file_path: filePath, reason: 'Outside uploads folder' });
-            continue;
-        }
-        try {
-            const stat = await fs.promises.stat(absolute);
-            if (!stat.isFile()) {
-                skipped.push({ file_path: filePath, reason: 'Not a file' });
-                continue;
-            }
-            await fs.promises.unlink(absolute);
-            deleted.push({ file_path: filePath, size: stat.size });
-            totalSize += stat.size;
-        } catch (error) {
-            skipped.push({ file_path: filePath, reason: error.message });
-        }
-    }
-
-    await logAudit(req, 'orphan_files_deleted', {
-        filePaths: deleted.map(file => file.file_path),
-        totalFiles: deleted.length,
-        totalSize,
-        remark,
-        metadata: { skipped },
-    });
-
-    return {
-        deleted_files: deleted.length,
-        deleted_size: totalSize,
-        deleted_size_gb: bytesToGb(totalSize),
-        skipped_files: skipped.length,
-        skipped,
-    };
+    const job = await insertStorageJob(req, 'orphan_cleanup', 'orphan_cleanup_requested', [], remark, paths);
+    await processStorageJob(job.id, processOrphanDeleteJob);
+    return buildStorageJobResponse(job);
 }
 
 async function writeMetadataFile(jobDir, metadata) {
@@ -781,8 +1012,83 @@ function buildZipEntries(preview, metadataPath = null) {
     return entries;
 }
 
-async function createJob(req, type, appointmentIds, remark, buildFiles) {
+function buildStorageJobResponse(job) {
+    const formatted = formatJobRow(job);
+    return {
+        ...formatted,
+        total_size_gb: bytesToGb(formatted.total_size),
+        expires_in_hours: formatted.expires_at ? ZIP_RETENTION_HOURS : null,
+        download_url: formatted.status === 'ready' ? `/api/storage-backup/zips/${formatted.id}/download` : null,
+    };
+}
+
+async function insertStorageJob(req, jobType, action, appointmentIds, remark, filePaths = []) {
+    const ids = toArray(appointmentIds);
+    const metadata = {
+        progress_percent: 0,
+        progress_message: 'Queued',
+        progress_current: 0,
+        progress_total: 0,
+    };
+    const insert = await db.query(
+        `INSERT INTO storage_backup_activity
+         (action, job_type, status, appointment_ids_json, file_paths_json, metadata_json, remark, performed_by, ip_address, user_agent)
+         VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)`,
+        [
+            action,
+            jobType,
+            JSON.stringify(ids),
+            JSON.stringify(filePaths || []),
+            JSON.stringify(metadata),
+            remark,
+            req.user.id,
+            req.ip || null,
+            String(req.headers['user-agent'] || '').slice(0, 500),
+        ]
+    );
+    return fetchJob(insert.insertId);
+}
+
+async function processStorageJob(jobId, worker) {
+    enqueueStorageJob(jobId, async () => {
+        const job = await fetchJob(jobId);
+        if (!job || TERMINAL_JOB_STATUSES.has(job.status)) return;
+
+        let metadata = {
+            ...safeJsonParse(job.metadata_json, {}),
+            progress_percent: 1,
+            progress_message: 'Processing',
+        };
+
+        const updateProgress = async (patch = {}, extraUpdates = {}) => {
+            metadata = { ...metadata, ...patch };
+            await persistJobProgress(jobId, metadata, extraUpdates);
+        };
+
+        try {
+            await updateProgress({}, { status: 'processing', error_message: null });
+            await worker(job, updateProgress);
+        } catch (error) {
+            await updateProgress(
+                {
+                    progress_message: 'Failed',
+                    error_message: error.message,
+                    finished_at: new Date().toISOString(),
+                },
+                {
+                    status: 'failed',
+                    error_message: error.message,
+                }
+            );
+            logger.error('Storage background job failed', { jobId, jobType: job.job_type, error: error.message });
+        }
+    });
+}
+
+async function queueZipJob(req, type, appointmentIds, remark, buildFiles) {
     assertSuperAdmin(req.user);
+    await markQueuedJobsFailedOnce();
+
     if (!String(remark || '').trim()) {
         const error = new Error('Remark is required');
         error.statusCode = 400;
@@ -790,118 +1096,151 @@ async function createJob(req, type, appointmentIds, remark, buildFiles) {
     }
 
     const ids = toArray(appointmentIds);
-    const preview = await previewAppointments(req, ids);
-    const totalSize = preview.totals.total_size;
-    if (type === 'case_backup' && (!totalSize || totalSize > MAX_SIMPLE_ZIP_BYTES)) {
-        const error = new Error(totalSize ? 'Selected files are too large for one ZIP. Please split into smaller batches.' : 'No existing files found for selected appointments.');
+    if (!ids.length) {
+        const error = new Error('Select at least one appointment');
         error.statusCode = 400;
         throw error;
     }
 
-    const now = Date.now();
-    const jobDir = path.join(BACKUP_ROOT, `job_${now}_${req.user.id || 'user'}`);
-    await fs.promises.mkdir(jobDir, { recursive: true });
-    const fileName = `${type}_${now}.zip`;
-    const zipPath = path.join(jobDir, fileName);
+    const action = type === 'tpa_pdf_backup' ? 'tpa_pdf_zip_requested' : 'backup_zip_requested';
+    const job = await insertStorageJob(req, type, action, ids, remark);
 
-    let entries = [];
-    let generatedTempFiles = [];
-    try {
-        if (buildFiles) {
-            const result = await buildFiles(preview, jobDir);
-            entries = result.entries || [];
-            generatedTempFiles = result.generatedTempFiles || [];
-        } else {
-            const metadataPath = await writeMetadataFile(jobDir, {
-                generated_at: new Date().toISOString(),
-                generated_by: req.user.id,
-                type,
-                remark,
-                preview,
+    await processStorageJob(job.id, async (jobRow, updateProgress) => {
+        const preview = await previewAppointmentsInternal(ids);
+        const totalSize = preview.totals.total_size;
+        if (type === 'case_backup' && (!totalSize || totalSize > MAX_SIMPLE_ZIP_BYTES)) {
+            throw new Error(totalSize ? 'Selected files are too large for one ZIP. Please split into smaller batches.' : 'No existing files found for selected appointments.');
+        }
+
+        const now = Date.now();
+        const jobDir = path.join(BACKUP_ROOT, `job_${now}_${jobRow.performed_by || 'user'}`);
+        await fs.promises.mkdir(jobDir, { recursive: true });
+        const fileName = `${type}_${now}.zip`;
+        const zipPath = path.join(jobDir, fileName);
+
+        let entries = [];
+        let generatedTempFiles = [];
+        try {
+            if (buildFiles) {
+                const result = await buildFiles(preview, jobDir, updateProgress, jobRow);
+                entries = result.entries || [];
+                generatedTempFiles = result.generatedTempFiles || [];
+            } else {
+                const metadataPath = await writeMetadataFile(jobDir, {
+                    generated_at: new Date().toISOString(),
+                    generated_by: jobRow.performed_by,
+                    type,
+                    remark,
+                    preview,
+                });
+                entries = buildZipEntries(preview, metadataPath);
+            }
+
+            if (!entries.length) {
+                throw new Error('No files available to zip');
+            }
+
+            let entryTotalSize = 0;
+            for (const entry of entries) {
+                const stat = await fs.promises.stat(entry.absolutePath);
+                entryTotalSize += stat.size;
+            }
+
+            if (entryTotalSize > MAX_SIMPLE_ZIP_BYTES) {
+                throw new Error('Selected files are too large for one ZIP. Please split into smaller batches.');
+            }
+
+            await updateProgress({
+                progress_percent: 10,
+                progress_message: 'Creating ZIP',
+                progress_current: 0,
+                progress_total: entries.length,
             });
-            entries = buildZipEntries(preview, metadataPath);
-        }
 
-        if (!entries.length) {
-            const error = new Error('No files available to zip');
-            error.statusCode = 400;
-            throw error;
-        }
+            await createZipFile(zipPath, entries, async ({ processedFiles, totalFiles, processedBytes, currentFile }) => {
+                const percent = Math.min(99, Math.max(10, Math.round((processedFiles / Math.max(totalFiles, 1)) * 100)));
+                await updateProgress({
+                    progress_percent: percent,
+                    progress_message: `Zipping ${processedFiles}/${totalFiles}`,
+                    progress_current: processedFiles,
+                    progress_total: totalFiles,
+                    processed_bytes: processedBytes,
+                    current_file: currentFile,
+                });
+                await delayImmediate();
+            });
 
-        let entryTotalSize = 0;
-        for (const entry of entries) {
-            const stat = await fs.promises.stat(entry.absolutePath);
-            entryTotalSize += stat.size;
-        }
-        if (entryTotalSize > MAX_SIMPLE_ZIP_BYTES) {
-            const error = new Error('Selected files are too large for one ZIP. Please split into smaller batches.');
-            error.statusCode = 400;
-            throw error;
-        }
+            const stat = await fs.promises.stat(zipPath);
+            const filePath = path.relative(APP_ROOT, zipPath).replace(/\\/g, '/');
+            const completedMetadata = {
+                ...safeJsonParse(jobRow.metadata_json, {}),
+                progress_percent: 100,
+                progress_message: 'Ready to download',
+                progress_current: entries.length,
+                progress_total: entries.length,
+                preview_totals: preview.totals,
+                finished_at: new Date().toISOString(),
+            };
+            await updateJobRow(jobRow.id, {
+                action: type === 'tpa_pdf_backup' ? 'tpa_pdf_zip_generated' : 'backup_zip_generated',
+                status: 'ready',
+                file_name: fileName,
+                file_path: filePath,
+                total_files: entries.length,
+                total_size: stat.size,
+                metadata_json: JSON.stringify(completedMetadata),
+                expires_at: new Date(Date.now() + (ZIP_RETENTION_HOURS * 60 * 60 * 1000)),
+                error_message: null,
+            });
 
-        await createZipFile(zipPath, entries);
-        const stat = await fs.promises.stat(zipPath);
-        const action = type === 'tpa_pdf_backup' ? 'tpa_pdf_zip_generated' : 'backup_zip_generated';
-        const insert = await db.query(
-            `INSERT INTO storage_backup_activity
-             (action, job_type, status, file_name, file_path, total_files, total_size, appointment_ids_json, file_paths_json, metadata_json, remark, performed_by, ip_address, user_agent, expires_at)
-             VALUES (?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR))`,
-            [
-                action,
-                type,
-                fileName,
-                path.relative(APP_ROOT, zipPath).replace(/\\/g, '/'),
-                entries.length,
-                stat.size,
-                JSON.stringify(ids),
-                JSON.stringify(entries.map(entry => entry.name)),
-                JSON.stringify({ preview_totals: preview.totals }),
+            await logJobAudit(jobRow, type === 'tpa_pdf_backup' ? 'tpa_pdf_zip_generated' : 'backup_zip_generated', {
+                appointmentIds: ids,
+                filePaths: entries.map(entry => entry.name),
+                totalFiles: entries.length,
+                totalSize: stat.size,
                 remark,
-                req.user.id,
-                req.ip || null,
-                String(req.headers['user-agent'] || '').slice(0, 500),
-                ZIP_RETENTION_HOURS,
-            ]
-        );
-
-        return {
-            id: insert.insertId,
-            job_type: type,
-            file_name: fileName,
-            total_files: entries.length,
-            total_size: stat.size,
-            total_size_gb: bytesToGb(stat.size),
-            expires_in_hours: ZIP_RETENTION_HOURS,
-            download_url: `/api/storage-backup/zips/${insert.insertId}/download`,
-        };
-    } finally {
-        for (const temp of generatedTempFiles) {
-            try {
-                await fs.promises.unlink(temp);
-            } catch (_) {
-                // Best effort cleanup for generated TPA PDFs.
+                metadata: { preview_totals: preview.totals },
+            });
+        } finally {
+            for (const temp of generatedTempFiles) {
+                try {
+                    await fs.promises.unlink(temp);
+                } catch (_) {
+                    // Best effort cleanup for generated TPA PDFs.
+                }
             }
         }
-    }
+    });
+
+    return buildStorageJobResponse(job);
 }
 
 async function generateBackupZip(req, appointmentIds, remark) {
-    return createJob(req, 'case_backup', appointmentIds, remark);
+    return queueZipJob(req, 'case_backup', appointmentIds, remark);
 }
 
 async function generateTpaPdfZip(req, appointmentIds, remark) {
-    return createJob(req, 'tpa_pdf_backup', appointmentIds, remark, async (preview, jobDir) => {
+    return queueZipJob(req, 'tpa_pdf_backup', appointmentIds, remark, async (preview, jobDir, updateProgress) => {
         const generatedTempFiles = [];
         const metadata = {
             generated_at: new Date().toISOString(),
-            generated_by: req.user.id,
             type: 'tpa_pdf_backup',
             remark,
             files: [],
         };
         const entries = [];
+        const totalItems = Math.max(preview.appointments.length, 1);
+        let processedItems = 0;
 
         for (const item of preview.appointments) {
+            processedItems += 1;
+            await updateProgress({
+                progress_percent: Math.min(45, Math.round((processedItems / totalItems) * 45)),
+                progress_message: `Generating TPA PDFs ${processedItems}/${totalItems}`,
+                progress_current: processedItems,
+                progress_total: totalItems,
+            });
+
             try {
                 const result = await appointmentsService.generateTPAPDF(item.appointment.id);
                 if (!result?.pdfPath) continue;
@@ -915,6 +1254,8 @@ async function generateTpaPdfZip(req, appointmentIds, remark) {
             } catch (error) {
                 metadata.files.push({ appointment_id: item.appointment.id, case_number: item.appointment.case_number, error: error.message });
             }
+
+            await delayImmediate();
         }
 
         const metadataPath = await writeMetadataFile(jobDir, metadata);
@@ -925,6 +1266,7 @@ async function generateTpaPdfZip(req, appointmentIds, remark) {
 
 async function downloadZip(req, res, jobId) {
     assertSuperAdmin(req.user);
+    await markQueuedJobsFailedOnce();
     await cleanupExpiredZips();
 
     const rows = await db.query(
@@ -943,6 +1285,7 @@ async function downloadZip(req, res, jobId) {
         error.statusCode = 404;
         throw error;
     }
+    const stat = await fs.promises.stat(absolute);
 
     await db.query('UPDATE storage_backup_activity SET downloaded_at = NOW() WHERE id = ?', [jobId]);
     await logAudit(req, 'zip_downloaded', {
@@ -953,6 +1296,8 @@ async function downloadZip(req, res, jobId) {
     });
 
     res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Content-Disposition', `attachment; filename="${job.file_name || `backup-${jobId}.zip`}"`);
     return res.sendFile(absolute);
 }
