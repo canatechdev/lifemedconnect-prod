@@ -392,6 +392,7 @@ async function listAppointments(req, params = {}) {
     const offset = (page - 1) * limit;
     const q = String(params.q || '').trim();
     const qcCompletedOnly = String(params.qcCompletedOnly || '') === 'true';
+    const backupStatus = String(params.backupStatus || 'all').trim();
     const fromDate = String(params.fromDate || '').trim();
     const toDate = String(params.toDate || '').trim();
     const allowedDateFields = {
@@ -409,6 +410,22 @@ async function listAppointments(req, params = {}) {
     }
     if (qcCompletedOnly) {
         where.push(`(LOWER(COALESCE(a.qc_status, '')) = 'completed' OR LOWER(COALESCE(a.status, '')) = 'completed')`);
+    }
+    const backupExistsSql = `
+        SELECT 1
+        FROM storage_backup_activity sba
+        WHERE sba.action = 'backup_zip_generated'
+          AND sba.job_type = 'case_backup'
+          AND JSON_CONTAINS(COALESCE(sba.appointment_ids_json, '[]'), CAST(a.id AS CHAR), '$')
+    `;
+    if (backupStatus === 'none') {
+        where.push(`NOT EXISTS (${backupExistsSql})`);
+    } else if (backupStatus === 'ready') {
+        where.push(`EXISTS (${backupExistsSql} AND sba.downloaded_at IS NULL)`);
+    } else if (backupStatus === 'downloaded') {
+        where.push(`EXISTS (${backupExistsSql} AND sba.downloaded_at IS NOT NULL)`);
+    } else if (backupStatus === 'backed_up') {
+        where.push(`EXISTS (${backupExistsSql})`);
     }
     if (fromDate) {
         where.push(`DATE(${dateField}) >= ?`);
