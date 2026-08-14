@@ -19,8 +19,7 @@ const MAX_SIMPLE_ZIP_BYTES = Math.min(
 const STORAGE_JOB_CONCURRENCY = Math.max(1, Number(process.env.STORAGE_JOB_CONCURRENCY || 1));
 const STORAGE_JOB_SCAN_LIMIT = Math.max(10, Number(process.env.STORAGE_JOB_SCAN_LIMIT || 15));
 
-const TERMINAL_JOB_STATUSES = new Set(['ready', 'completed', 'failed', 'expired', 'manual_deleted']);
-const ACTIVE_JOB_STATUSES = ['queued', 'processing', 'ready'];
+const TERMINAL_JOB_STATUSES = new Set(['ready', 'completed', 'failed', 'expired', 'manual_deleted', 'cancelled']);
 
 const storageJobQueue = [];
 let runningStorageJobs = 0;
@@ -246,11 +245,13 @@ async function logJobAudit(job, action, payload = {}) {
 
 function formatJobRow(row) {
     const metadata = safeJsonParse(row.metadata_json, {});
+    const status = row.status || null;
+    const id = Number(row.id);
     return {
-        id: Number(row.id),
+        id,
         action: row.action || null,
         job_type: row.job_type || null,
-        status: row.status || null,
+        status,
         file_name: row.file_name || null,
         file_path: row.file_path || null,
         total_files: Number(row.total_files || 0),
@@ -264,6 +265,7 @@ function formatJobRow(row) {
         progress_message: metadata.progress_message || null,
         progress_current: Number(metadata.progress_current || 0),
         progress_total: Number(metadata.progress_total || 0),
+        download_url: status === 'ready' ? `/api/storage-backup/zips/${id}/download` : null,
         metadata,
     };
 }
@@ -354,7 +356,7 @@ async function getSummary(req) {
          FROM storage_backup_activity
          WHERE job_type IS NOT NULL
            AND (
-                status IN ('queued', 'processing', 'completed', 'failed')
+                status IN ('queued', 'processing', 'completed', 'failed', 'cancelled')
                 OR (status = 'ready' AND (expires_at IS NULL OR expires_at > NOW()))
            )
          ORDER BY created_at DESC
@@ -1084,6 +1086,49 @@ async function processStorageJob(jobId, worker) {
     });
 }
 
+async function cancelJob(req, jobId, remark = '') {
+    assertSuperAdmin(req.user);
+    const job = await fetchJob(jobId);
+    if (!job || !job.job_type) {
+        const error = new Error('Storage job not found');
+        error.statusCode = 404;
+        throw error;
+    }
+
+    if (job.status !== 'queued') {
+        const error = new Error('Only queued jobs can be cancelled safely');
+        error.statusCode = 409;
+        throw error;
+    }
+
+    const metadata = {
+        ...safeJsonParse(job.metadata_json, {}),
+        progress_percent: 100,
+        progress_message: 'Cancelled before processing',
+        cancelled_at: new Date().toISOString(),
+        cancelled_by: req.user?.id || null,
+    };
+
+    await updateJobRow(job.id, {
+        status: 'cancelled',
+        error_message: null,
+        metadata_json: JSON.stringify(metadata),
+    });
+
+    await logAudit(req, 'storage_job_cancelled', {
+        jobId: job.id,
+        appointmentIds: safeJsonParse(job.appointment_ids_json, []),
+        filePaths: safeJsonParse(job.file_paths_json, []),
+        remark: String(remark || '').trim() || 'Cancelled before processing',
+        metadata: {
+            job_type: job.job_type,
+        },
+    });
+
+    const updatedJob = await fetchJob(job.id);
+    return buildStorageJobResponse(updatedJob);
+}
+
 async function queueZipJob(req, type, appointmentIds, remark, buildFiles) {
     assertSuperAdmin(req.user);
     await markQueuedJobsFailedOnce();
@@ -1375,6 +1420,7 @@ module.exports = {
     generateTpaPdfZip,
     downloadZip,
     deleteZip,
+    cancelJob,
     scanOrphanFiles,
     deleteAppointmentFiles,
     deleteOrphanFiles,

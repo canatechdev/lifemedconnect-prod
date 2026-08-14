@@ -88,6 +88,16 @@ router.delete('/storage-backup/zips/:id', verifyToken, async (req, res) => {
     }
 });
 
+router.patch('/storage-backup/jobs/:id/cancel', verifyToken, async (req, res) => {
+    try {
+        const result = await storageBackupService.cancelJob(req, req.params.id, req.body.remark);
+        return ApiResponse.success(res, result, 'Storage job cancelled successfully');
+    } catch (error) {
+        logger.error('Storage job cancel failed', { error: error.message, jobId: req.params.id, userId: req.user?.id });
+        return handleRouteError(res, error);
+    }
+});
+
 router.get('/storage-backup/orphans', verifyToken, async (req, res) => {
     try {
         const result = await storageBackupService.scanOrphanFiles(req, req.query);
