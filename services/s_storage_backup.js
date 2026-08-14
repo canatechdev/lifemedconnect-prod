@@ -358,8 +358,7 @@ async function getSummary(req) {
                 OR (status = 'ready' AND (expires_at IS NULL OR expires_at > NOW()))
            )
          ORDER BY created_at DESC
-         LIMIT ?`,
-        [STORAGE_JOB_SCAN_LIMIT]
+         LIMIT ${STORAGE_JOB_SCAN_LIMIT}`
     );
 
     return {
