@@ -21,7 +21,7 @@ function isTpaEmailEnabled() {
 
 function requiresAmountEvidence(costType) {
     const normalized = String(costType || '').trim().toLowerCase();
-    return Boolean(normalized) && !['credit', 'client', 'client cost'].includes(normalized);
+    return Boolean(normalized) && !['credit'].includes(normalized);
 }
 
 function validateAmountEvidence(appointment) {
@@ -31,15 +31,15 @@ function validateAmountEvidence(appointment) {
 
     const amount = Number(appointment.amount);
     const hasAmount = Number.isFinite(amount) && amount > 0;
-    const hasEvidence = Boolean(String(appointment.amount_upload || '').trim());
+    const hasUtr = Boolean(String(appointment.utr_number || '').trim());
 
-    if (hasAmount && hasEvidence) {
+    if (hasAmount && hasUtr) {
         return null;
     }
 
     const missing = [];
     if (!hasAmount) missing.push('amount');
-    if (!hasEvidence) missing.push('payment evidence');
+    if (!hasUtr) missing.push('UTR number');
 
     return {
         success: false,

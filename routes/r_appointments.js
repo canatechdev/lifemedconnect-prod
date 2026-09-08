@@ -293,12 +293,8 @@ router.post('/appointments',
     asyncHandler(async (req, res) => {
         logger.info('Creating appointment', { userId: req.user.id, hasFiles: !!req.files });
 
-        // Handle file upload for amount_upload
-        const uploadedFile = await handleSingleFileFromAny(req.files, 'amount_upload', 'appointment_amount');
-        if (uploadedFile) {
-            req.body.amount_upload = uploadedFile;
-        } else if (req.body.amount_upload === '') {
-            req.body.amount_upload = null;
+        if (req.body.utr_number === '') {
+            req.body.utr_number = null;
         }
 
         // Normalize dates and times
@@ -717,12 +713,8 @@ router.put('/appointments/:id',
     asyncHandler(async (req, res) => {
         logger.info('Updating appointment', { appointmentId: req.params.id, userId: req.user.id, hasFiles: !!req.files });
 
-        // Handle file upload for amount_upload
-        const uploadedFile = await handleSingleFileFromAny(req.files, 'amount_upload', 'appointment_amount');
-        if (uploadedFile) {
-            req.body.amount_upload = uploadedFile;
-        } else if (req.body.amount_upload === '') {
-            req.body.amount_upload = null;
+        if (req.body.utr_number === '') {
+            req.body.utr_number = null;
         }
 
         // Normalize dates and times
@@ -848,7 +840,7 @@ router.patch('/appointments/bulk-update',
         updates.updated_by = req.user.id;
 
         // Cost/amount only if bulk permission
-        if ((updates.cost_type !== undefined || updates.amount !== undefined) && !hasBulk) {
+        if ((updates.cost_type !== undefined || updates.amount !== undefined || updates.utr_number !== undefined) && !hasBulk) {
             return ApiResponse.error(res, 'Permission denied: appointments.bulk_operations required for cost updates', 403);
         }
 
@@ -876,7 +868,7 @@ router.post('/appointments/UpdateIds', verifyToken, validateRequest(appointmentB
     const value = req.body;
 
     // Cost/amount only if bulk permission
-    if ((value.cost_type !== undefined || value.amount !== undefined) && !hasBulk) {
+    if ((value.cost_type !== undefined || value.amount !== undefined || value.utr_number !== undefined) && !hasBulk) {
         return ApiResponse.error(res, 'Permission denied: appointments.bulk_operations required for cost updates', 403);
     }
 
@@ -901,6 +893,7 @@ router.post('/appointments/UpdateIds', verifyToken, validateRequest(appointmentB
             assigned_technician_id: value.assigned_technician_id,
             cost_type: value.cost_type,
             amount: value.amount,
+            utr_number: value.utr_number,
             updated_by: req.user.id,
             updated_at: new Date(),
         },

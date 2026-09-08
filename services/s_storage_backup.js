@@ -673,7 +673,6 @@ async function previewAppointments(req, appointmentIds) {
 
 async function getReferencedUploadPaths() {
     const queries = [
-        `SELECT amount_upload AS file_path FROM appointments WHERE amount_upload IS NOT NULL AND is_deleted = 0`,
         `SELECT file_path FROM appointment_reports WHERE file_path IS NOT NULL AND is_deleted = 0`,
         `SELECT file_path FROM appointment_categorized_reports WHERE file_path IS NOT NULL AND is_deleted = 0`,
         `SELECT file_path FROM appointment_documents WHERE file_path IS NOT NULL AND is_deleted = 0`,

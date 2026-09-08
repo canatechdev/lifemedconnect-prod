@@ -272,7 +272,7 @@ async function createAppointment(row, connection = null) {
                 status, assigned_technician_id, assigned_at, assigned_by,
                 customer_arrived_at, medical_started_at, medical_completed_at,
                 remarks, cancellation_reason, created_by,
-                cost_type, amount, amount_upload, case_severity,
+                cost_type, amount, utr_number, case_severity,
                 created_at, updated_at, is_active, split_type
             )
             VALUES (
@@ -299,7 +299,7 @@ async function createAppointment(row, connection = null) {
             safe(row.assigned_at), safe(row.assigned_by), safe(row.customer_arrived_at),
             safe(row.medical_started_at), safe(row.medical_completed_at), safe(row.remarks),
             safe(row.cancellation_reason), safe(row.created_by), safe(row.cost_type),
-            safe(row.amount), safe(row.amount_upload), safe(row.case_severity ?? 0)
+            safe(row.amount), safe(row.utr_number), safe(row.case_severity ?? 0)
         ];
 
         const [appointmentResult] = await conn.query(appointmentSql, appointmentParams);
@@ -419,7 +419,7 @@ async function cloneAppointment(sourceAppointmentId, userId = null) {
                 status, assigned_technician_id, assigned_at, assigned_by,
                 customer_arrived_at, medical_started_at, medical_completed_at,
                 remarks, cancellation_reason, created_by, created_at, updated_at, is_deleted,
-                has_pending_approval, test_name, cost_type, amount, amount_upload, case_severity,
+                has_pending_approval, test_name, cost_type, amount, utr_number, case_severity,
                 updated_by, is_active, split_type, medical_status, qc_status, medical_remarks,
                 pending_report_types, aadhaar_number, pan_number, arrival_time, medical_start_time, medical_end_time,
                 pushed_back, pushback_remarks, pushed_back_by, pushed_back_at,
@@ -476,7 +476,7 @@ async function cloneAppointment(sourceAppointmentId, userId = null) {
             createdBy,
             safe(source.cost_type),
             safe(source.amount),
-            safe(source.amount_upload),
+            safe(source.utr_number),
             safe(source.case_severity ?? 0),
             userId || null,
             safe(source.is_active ?? 1),
@@ -893,6 +893,10 @@ async function bulkUpdateAppointments(ids, updates) {
     if (updates.amount !== undefined) {
         fields.push('amount = ?');
         values.push(updates.amount);
+    }
+    if (updates.utr_number !== undefined) {
+        fields.push('utr_number = ?');
+        values.push(updates.utr_number);
     }
     if (updates.status !== undefined) {
         fields.push('status = ?');

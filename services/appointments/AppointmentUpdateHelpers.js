@@ -98,7 +98,7 @@ async function updateAppointmentBasicFields(connection, id, row) {
         'visit_type', 'customer_category', 'appointment_date', 'appointment_time', 'confirmed_time',
         'status', 'assigned_technician_id', 'assigned_at', 'assigned_by',
         'customer_arrived_at', 'medical_started_at', 'medical_completed_at',
-        'remarks', 'cancellation_reason', 'updated_by', 'cost_type', 'amount', 'amount_upload', 'case_severity'
+        'remarks', 'cancellation_reason', 'updated_by', 'cost_type', 'amount', 'utr_number', 'case_severity'
     ];
 
     for (const field of allowedFields) {

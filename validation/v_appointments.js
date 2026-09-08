@@ -38,7 +38,7 @@ const appointmentCreateSchema = Joi.object({
     cancellation_reason: Joi.string().allow(null, '').optional(),
     cost_type: Joi.string().allow(null, '').optional(),
     amount: Joi.number().allow(null).optional(),
-    amount_upload: Joi.string().allow(null, '').optional(),
+    utr_number: Joi.string().allow(null, '').optional(),
     case_severity: Joi.number().allow(null).optional(),
     selected_items: Joi.alternatives()
         .try(
@@ -120,7 +120,7 @@ const appointmentUpdateSchema = Joi.object({
     cancellation_reason: Joi.string().allow(null, '').optional(),
     cost_type: Joi.string().allow(null, '').optional(),
     amount: Joi.number().allow(null).optional(),
-    amount_upload: Joi.string().allow(null, '').optional(),
+    utr_number: Joi.string().allow(null, '').optional(),
     case_severity: Joi.number().allow(null).optional(),
     selected_items: Joi.alternatives()
         .try(
@@ -180,6 +180,7 @@ const appointmentBulkUpdateSchema = Joi.object({
     assigned_technician_id: Joi.number().integer().positive().optional(),
     cost_type: Joi.string().optional().allow(null),
     amount: Joi.number().optional().allow(null),
+    utr_number: Joi.string().optional().allow(null, ''),
     status: Joi.string().optional()
 });
 

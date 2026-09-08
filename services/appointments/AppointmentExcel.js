@@ -558,7 +558,7 @@ async function processUploadedFile(filePath, user) {
                     assigned_technician_id: null,
                     cost_type: null,
                     amount: null,
-                    amount_upload: null,
+                    utr_number: null,
 
                     created_by: user.id,
                     created_at: new Date(),
@@ -837,7 +837,7 @@ async function generateExportExcel(appointments, filters = {}) {
         // Add filter info header
         let currentRow = 1;
         worksheet.getRow(currentRow).values = ['APPOINTMENTS EXPORT'];
-        worksheet.mergeCells(`A${currentRow}:AL${currentRow}`);
+        worksheet.mergeCells(`A${currentRow}:AM${currentRow}`);
         worksheet.getCell(`A${currentRow}`).font = { bold: true, size: 16 };
         worksheet.getCell(`A${currentRow}`).alignment = { horizontal: 'center' };
         currentRow++;
@@ -869,7 +869,7 @@ async function generateExportExcel(appointments, filters = {}) {
             'Email', 'Address', 'State', 'City', 'Pincode', 'Country', 'Landmark',
             'Visit Type', 'Customer Category', 'Appointment Date', 'Confirmed Date', 'Appointment Time', 
             'Confirmed Time', 'Status', 'Medical Status', 'QC Status',
-            'Cost Type', 'Amount',
+            'Cost Type', 'UTR Number', 'Amount',
             'Test Count', 'Categories', 'Tests', 'Assigned Technicians',
             'Remarks', 'Medical Remarks', 'All Remarks',
             'Created At'
@@ -921,6 +921,7 @@ async function generateExportExcel(appointments, filters = {}) {
                 apt.medical_status,
                 apt.qc_status,
                 apt.cost_type,
+                apt.utr_number || '',
                 apt.amount,
                 apt.test_count || 0,
                 apt.categories_info || '',
