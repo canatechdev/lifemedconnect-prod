@@ -54,7 +54,7 @@ const updateSchema = Joi.object({
     full_name: Joi.string().max(100).optional(),
     email: Joi.string().email().optional(),
     password: Joi.string().min(4).optional(),
-    role_id: Joi.number().integer().valid(1, 2, 3 ,4,5).optional(), 
+    role_id: Joi.number().integer().positive().optional(),
      is_active: Joi.number().integer().valid(1,0).optional(),
     telephony_username: Joi.alternatives().try(
         Joi.string().max(100).optional(),

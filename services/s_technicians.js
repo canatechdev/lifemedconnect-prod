@@ -11,8 +11,8 @@ async function createTechnician(row) {
         });
     }
 
-    const sql = `INSERT INTO technicians (user_id, center_id, technician_code, technician_type, rate_per_appointment, profile_pic, full_name, mobile, email, home_gps_latitude, home_gps_longitude, home_address, qualification, experience_years, is_active ,created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`;
+    const sql = `INSERT INTO technicians (user_id, center_id, technician_code, technician_type, rate_per_appointment, profile_pic, full_name, mobile, email, home_gps_latitude, home_gps_longitude, home_address, qualification, experience_years, call_center_priority, male_daily_capacity, female_daily_capacity, other_daily_capacity, service_pincodes, is_active, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`;
     const params = [
         row.user_id ?? null,
         row.center_id,
@@ -28,6 +28,11 @@ async function createTechnician(row) {
         row.home_address || null,
         row.qualification || null,
         row.experience_years ?? null,
+        row.call_center_priority ?? null,
+        row.male_daily_capacity ?? null,
+        row.female_daily_capacity ?? null,
+        row.other_daily_capacity ?? null,
+        row.service_pincodes ?? null,
         row.is_active ?? 1
     ];
     const result = await db.query(sql, params);
@@ -138,10 +143,63 @@ async function softDeleteTechnician(ids) {
 
 async function deleteTechnician(id) { const result = await db.query('DELETE FROM technicians WHERE id = ?', [id]); return result.affectedRows; }
 
+async function getTechnicianUnavailability(technicianId) {
+    const periods = await db.query(`
+        SELECT tu.id, tu.technician_id, tu.unavailable_from, tu.unavailable_to,
+               tu.reason, tu.created_by, tu.created_at, tu.initial_dc_notified_at,
+               tu.escalation_notified_at, u.full_name AS created_by_name
+        FROM technician_unavailability tu
+        LEFT JOIN users u ON u.id = tu.created_by
+        WHERE tu.technician_id = ? AND tu.is_deleted = 0
+        ORDER BY tu.unavailable_from DESC, tu.id DESC
+    `, [technicianId]);
+    return periods;
+}
+
+async function addTechnicianUnavailability(technicianId, data, userId) {
+    const overlap = await db.query(`
+        SELECT id FROM technician_unavailability
+        WHERE technician_id = ? AND is_deleted = 0
+          AND unavailable_from <= ? AND unavailable_to >= ?
+        LIMIT 1
+    `, [technicianId, data.unavailable_to, data.unavailable_from]);
+    if (overlap.length) {
+        const error = new Error('This technician already has an overlapping unavailable period.');
+        error.statusCode = 409;
+        error.isOperational = true;
+        throw error;
+    }
+    const result = await db.query(`
+        INSERT INTO technician_unavailability
+            (technician_id, unavailable_from, unavailable_to, reason, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, NOW())
+    `, [technicianId, data.unavailable_from, data.unavailable_to, data.reason || null, userId]);
+    return result.insertId;
+}
+
+async function removeTechnicianUnavailability(technicianId, periodId, userId) {
+    const result = await db.query(`
+        UPDATE technician_unavailability
+        SET is_deleted = 1, updated_by = ?, updated_at = NOW()
+        WHERE id = ? AND technician_id = ? AND is_deleted = 0
+    `, [userId, periodId, technicianId]);
+    return result.affectedRows;
+}
 
 
 
 
-module.exports = { createTechnician, listTechnicians, getTechnician, updateTechnician, deleteTechnician, softDeleteTechnician };
+
+module.exports = {
+    createTechnician,
+    listTechnicians,
+    getTechnician,
+    updateTechnician,
+    deleteTechnician,
+    softDeleteTechnician,
+    getTechnicianUnavailability,
+    addTechnicianUnavailability,
+    removeTechnicianUnavailability,
+};
 
 

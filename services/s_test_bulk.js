@@ -474,7 +474,10 @@ class TestBulkService extends BaseService {
         const itemType = String(type || '').trim().toLowerCase();
         const itemName = String(itemNameRaw || '').trim();
         const desc = String(description || '').trim();
-        const rateInput = String(rateStr || '').trim();
+        // Preserve numeric zero; it is a valid rate and must not be treated as blank.
+        const rateInput = rateStr === null || rateStr === undefined
+          ? ''
+          : String(rateStr).trim();
 
         try {
           // Required fields validation

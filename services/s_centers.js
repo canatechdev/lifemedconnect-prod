@@ -58,6 +58,8 @@ class CentersService extends BaseService {
         dc_photos: data.dc_photos ?? null,
         gps_latitude: data.gps_latitude ?? null,
         gps_longitude: data.gps_longitude ?? null,
+        service_radius_km: data.service_radius_km ?? null,
+        extra_charge_per_km: data.extra_charge_per_km ?? null,
         letterhead_path: data.letterhead_path ?? null,
         footer_path: data.footer_path ?? null,
         is_active: data.is_active !== undefined ? data.is_active : 1,

@@ -115,6 +115,10 @@ router.post(
       created_by: req.user.id
     };
 
+    ['gps_latitude', 'gps_longitude', 'service_radius_km', 'extra_charge_per_km'].forEach((field) => {
+      if (centerData[field] === '') centerData[field] = null;
+    });
+
     // Convert empty doctor IDs to null
     ['associate_doctor_1_id', 'associate_doctor_2_id', 'associate_doctor_3_id', 'associate_doctor_4_id', 'user_id'].forEach(f => {
       if (centerData[f] === '') centerData[f] = null;
@@ -219,6 +223,10 @@ router.put(
       if (!excludeFields.includes(key)) {
         updateData[key] = req.body[key];
       }
+    });
+
+    ['gps_latitude', 'gps_longitude', 'service_radius_km', 'extra_charge_per_km'].forEach((field) => {
+      if (updateData[field] === '') updateData[field] = null;
     });
     
     // Now handle file fields - only include if explicitly changed

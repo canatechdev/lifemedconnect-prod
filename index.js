@@ -187,6 +187,7 @@ const appointmentLifecycleRoutes = require('./routes/r_appointment_lifecycle');
 const tpaRoutes = require('./routes/r_tpa');
 const tpaManagementRoutes = require('./routes/r_tpa_management');
 const storageBackupRoutes = require('./routes/r_storage_backup');
+const callCenterRoutes = require('./routes/r_call_center');
 
 // Health check route
 app.get('/', (req, res) => {
@@ -258,6 +259,7 @@ app.use('/api/appointment-lifecycle', appointmentLifecycleRoutes);
 app.use('/api/tpa', tpaRoutes);
 app.use('/api/tpa-management', tpaManagementRoutes);
 app.use('/api', storageBackupRoutes);
+app.use('/api/call-center', callCenterRoutes);
 
 // SPA Fallback: Serve index.html for all non-API routes (production only)
 // This allows React Router to handle client-side routing
@@ -352,6 +354,13 @@ server.listen(PORT, async () => {
         logger.info(' SparkTG Socket Service initialized');
     } catch (error) {
         logger.warn('SparkTG Socket Service initialization failed:', error.message);
+    }
+
+    try {
+        const { startTechnicianUnavailabilityEscalationMonitor } = require('./services/TechnicianUnavailabilityAlertService');
+        startTechnicianUnavailabilityEscalationMonitor();
+    } catch (error) {
+        logger.error('Technician unavailable escalation monitor could not start', { message: error.message });
     }
 });
 

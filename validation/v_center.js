@@ -29,6 +29,8 @@ const centerSchemas = {
     country: Joi.string().max(45).optional().allow(null, ''),
     gps_latitude: Joi.number().precision(8).optional().allow(null, ''),
     gps_longitude: Joi.number().precision(8).optional().allow(null, ''),
+    service_radius_km: Joi.number().min(0).precision(2).optional().allow(null, ''),
+    extra_charge_per_km: Joi.number().min(0).precision(2).optional().allow(null, ''),
     is_active: Joi.optional().default(1),
     letterhead_path: Joi.string().max(500).optional().allow(null, ''),
     associate_doctor_1_id: Joi.number().integer().optional().allow(null, ''),
@@ -66,6 +68,8 @@ const centerSchemas = {
     country: Joi.string().max(45).optional().allow(null, ''),
     gps_latitude: Joi.number().precision(8).optional().allow(null, ''),
     gps_longitude: Joi.number().precision(8).optional().allow(null, ''),
+    service_radius_km: Joi.number().min(0).precision(2).optional().allow(null, ''),
+    extra_charge_per_km: Joi.number().min(0).precision(2).optional().allow(null, ''),
     is_active: Joi.optional(),
     letterhead_path: Joi.string().max(500).optional().allow(null, ''),
     dc_photos: Joi.any().optional(), // For file uploads

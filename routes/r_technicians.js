@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { verifyToken } = require('../lib/auth');
-const { requirePermission } = require('../lib/permissions');
+const { hasPermission, requirePermission } = require('../lib/permissions');
 const service = require('../services/s_technicians');
 const Joi = require('joi');
 const { asyncHandler } = require('../middleware/errorHandler');
@@ -12,6 +12,7 @@ const { parsePaginationParams } = require('../lib/helpers');
 const { mixedUpload } = require('../lib/multer');
 const { processSingleFile } = require('../lib/fileUpload');
 const db = require('../lib/dbconnection');
+const unavailabilityAlerts = require('../services/TechnicianUnavailabilityAlertService');
 
 // Helper: Look up technician_code for file organization
 async function getTechnicianCode(technicianId) {
@@ -44,6 +45,11 @@ const technicianSchema = Joi.object({
   home_address: Joi.string().optional().allow(null, ''),
   qualification: Joi.string().max(255).optional().allow(null, ''),
   experience_years: Joi.number().integer().min(0).optional().allow(null),
+  call_center_priority: Joi.number().integer().min(1).max(9999).optional().allow(null, ''),
+  male_daily_capacity: Joi.number().integer().min(0).max(1000).optional().allow(null, ''),
+  female_daily_capacity: Joi.number().integer().min(0).max(1000).optional().allow(null, ''),
+  other_daily_capacity: Joi.number().integer().min(0).max(1000).optional().allow(null, ''),
+  service_pincodes: Joi.string().max(1000).optional().allow(null, ''),
   is_active: Joi.number().optional(),
   profile_pic_remove: Joi.string().valid('true', 'false').optional()
 });
@@ -53,6 +59,38 @@ const technicianUpdateSchema = technicianSchema.fork(Object.keys(technicianSchem
 const deleteTechniciansSchema = Joi.object({
   ids: Joi.array().items(Joi.number().integer().positive()).min(1).required()
 });
+
+const technicianUnavailabilitySchema = Joi.object({
+  unavailable_from: Joi.date().iso().required(),
+  unavailable_to: Joi.date().iso().min(Joi.ref('unavailable_from')).required(),
+  reason: Joi.string().trim().max(500).allow('', null).optional(),
+});
+
+const callCenterPlanningFields = [
+  'call_center_priority',
+  'male_daily_capacity',
+  'female_daily_capacity',
+  'other_daily_capacity',
+  'service_pincodes',
+];
+
+function normalizeServicePincodes(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const pincodes = String(value)
+    .split(/[\s,;|]+/)
+    .map((pincode) => pincode.replace(/\D/g, ''))
+    .filter((pincode) => /^\d{6}$/.test(pincode));
+  return Array.from(new Set(pincodes)).join(',') || null;
+}
+
+function hasCallCenterPlanningFields(data) {
+  return callCenterPlanningFields.some((field) => Object.prototype.hasOwnProperty.call(data, field));
+}
+
+function canManageTechnicianPlanning(req) {
+  const permissions = req.user?.permissions || [];
+  return hasPermission(permissions, 'technicians.update') || hasPermission(permissions, 'technicians.create');
+}
 
 
 
@@ -97,6 +135,9 @@ router.get('/technicians/:id', verifyToken, asyncHandler(async (req, res) => {
   return ApiResponse.success(res, row);
 }));
 router.post('/technicians', verifyToken, requirePermission('technicians.create'), mixedUpload.single('profile_pic_file'), validateRequest(technicianSchema), asyncHandler(async (req, res) => {
+  if (hasCallCenterPlanningFields(req.body) && !canManageTechnicianPlanning(req)) {
+    return ApiResponse.forbidden(res, 'You do not have permission to manage technician planning settings');
+  }
   const profilePicPath = req.file ? await processSingleFile(req.file, 'technicians') : null;
   const technicianData = {
     ...req.body,
@@ -105,6 +146,12 @@ router.post('/technicians', verifyToken, requirePermission('technicians.create')
 
   if (req.body.profile_pic_remove === 'true') {
     technicianData.profile_pic = null;
+  }
+  ['call_center_priority', 'male_daily_capacity', 'female_daily_capacity', 'other_daily_capacity'].forEach((field) => {
+    if (technicianData[field] === '') technicianData[field] = null;
+  });
+  if (Object.prototype.hasOwnProperty.call(technicianData, 'service_pincodes')) {
+    technicianData.service_pincodes = normalizeServicePincodes(technicianData.service_pincodes);
   }
   delete technicianData.profile_pic_remove;
 
@@ -117,6 +164,9 @@ router.post('/technicians', verifyToken, requirePermission('technicians.create')
 
 
 router.put('/technicians/:id', verifyToken, requirePermission('technicians.update'), mixedUpload.single('profile_pic_file'), validateRequest(technicianUpdateSchema), asyncHandler(async (req, res) => {
+  if (hasCallCenterPlanningFields(req.body) && !canManageTechnicianPlanning(req)) {
+    return ApiResponse.forbidden(res, 'You do not have permission to manage technician planning settings');
+  }
   const techCode = await getTechnicianCode(req.params.id);
   let profilePicPath = null;
   if (req.file) {
@@ -132,6 +182,12 @@ router.put('/technicians/:id', verifyToken, requirePermission('technicians.updat
 
   // Remove the removal flag from updates if present
   delete updates.profile_pic_remove;
+  ['call_center_priority', 'male_daily_capacity', 'female_daily_capacity', 'other_daily_capacity'].forEach((field) => {
+    if (updates[field] === '') updates[field] = null;
+  });
+  if (Object.prototype.hasOwnProperty.call(updates, 'service_pincodes')) {
+    updates.service_pincodes = normalizeServicePincodes(updates.service_pincodes);
+  }
 
   const affected = await service.updateTechnician(req.params.id, updates);
   if (!affected) {
@@ -140,6 +196,53 @@ router.put('/technicians/:id', verifyToken, requirePermission('technicians.updat
 
   logger.info('Technician updated', { technicianId: req.params.id, updatedBy: req.user.id });
   return ApiResponse.success(res, { updated: affected }, 'Technician updated successfully');
+}));
+
+router.get('/technicians/:id/unavailability', verifyToken, requirePermission('technicians.update'), asyncHandler(async (req, res) => {
+  return ApiResponse.success(res, await service.getTechnicianUnavailability(Number(req.params.id)));
+}));
+
+router.post('/technicians/:id/unavailability/impact', verifyToken, requirePermission('technicians.update'), validateRequest(technicianUnavailabilitySchema), asyncHandler(async (req, res) => {
+  const appointments = await unavailabilityAlerts.getAffectedAppointments(
+    Number(req.params.id), req.body.unavailable_from, req.body.unavailable_to,
+  );
+  return ApiResponse.success(res, appointments, 'Affected appointments retrieved successfully');
+}));
+
+router.get('/technicians/:id/unavailability/:periodId/affected-appointments', verifyToken, requirePermission('technicians.update'), asyncHandler(async (req, res) => {
+  const periods = await service.getTechnicianUnavailability(Number(req.params.id));
+  const period = periods.find((item) => Number(item.id) === Number(req.params.periodId));
+  if (!period) return ApiResponse.notFound(res, 'Unavailable period not found');
+  const appointments = await unavailabilityAlerts.getAffectedAppointments(
+    Number(req.params.id), period.unavailable_from, period.unavailable_to,
+  );
+  return ApiResponse.success(res, appointments, 'Affected appointments retrieved successfully');
+}));
+
+router.post('/technicians/:id/unavailability', verifyToken, requirePermission('technicians.update'), validateRequest(technicianUnavailabilitySchema), asyncHandler(async (req, res) => {
+  const id = await service.addTechnicianUnavailability(Number(req.params.id), req.body, req.user.id);
+  let appointments = [];
+  let notification = { sent: false, reason: 'not_required' };
+  try {
+    appointments = await unavailabilityAlerts.getAffectedAppointments(
+      Number(req.params.id), req.body.unavailable_from, req.body.unavailable_to,
+    );
+    notification = await unavailabilityAlerts.sendInitialDcNotice(id, appointments);
+  } catch (error) {
+    logger.error('Technician unavailable period saved but DC notification could not be processed', {
+      technicianId: req.params.id,
+      periodId: id,
+      message: error.message,
+    });
+    notification = { sent: false, reason: 'notification_processing_failed' };
+  }
+  return ApiResponse.success(res, { id, affected_appointments: appointments, notification }, 'Technician unavailable period added successfully', 201);
+}));
+
+router.delete('/technicians/:id/unavailability/:periodId', verifyToken, requirePermission('technicians.update'), asyncHandler(async (req, res) => {
+  const updated = await service.removeTechnicianUnavailability(Number(req.params.id), Number(req.params.periodId), req.user.id);
+  if (!updated) return ApiResponse.notFound(res, 'Unavailable period not found');
+  return ApiResponse.success(res, { updated }, 'Technician unavailable period removed successfully');
 }));
 
 
