@@ -7,7 +7,30 @@ const express = require('express');
 const router = express.Router();
 const logger = require('../lib/logger');
 const authenticateTPA = require('../middleware/tpaAuth');
-const { TPAAuthService, TPAMappingService, TPAAppointmentService } = require('../services/tpa');
+const {
+    TPAAuthService,
+    TPAMappingService,
+    TPAAppointmentService,
+    TPAAppointmentActions,
+    TPAAppointmentDirectory
+} = require('../services/tpa');
+
+function getRequestId(req) {
+    return req.headers['idempotency-key'] || req.headers['x-request-id'] || null;
+}
+
+function sendActionError(res, error, action) {
+    const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;
+    logger.error(`Error processing TPA ${action}`, {
+        error: error.message,
+        statusCode
+    });
+    return res.status(statusCode).json({
+        success: false,
+        error: statusCode === 500 ? `Failed to ${action} appointment` : error.message,
+        message: error.message
+    });
+}
 
 
 /**
@@ -20,6 +43,84 @@ router.get('/health', authenticateTPA, (req, res) => {
         tpa: req.tpaContext.client_name,
         timestamp: new Date().toISOString()
     });
+});
+
+/**
+ * Change the requested appointment date/time before customer confirmation.
+ * selected_item_ids is optional; when supplied, only those test rows are
+ * moved into a fresh pending case and rescheduled.
+ */
+router.post('/appointments/reschedule', authenticateTPA, async (req, res) => {
+    try {
+        const result = await TPAAppointmentActions.execute(
+            TPAAppointmentActions.ACTIONS.RESCHEDULE,
+            req.body,
+            req.tpaContext,
+            getRequestId(req)
+        );
+        return res.json({
+            success: true,
+            message: result.scope === 'partial'
+                ? 'Selected tests split and rescheduled successfully'
+                : 'Appointment rescheduled successfully',
+            data: result
+        });
+    } catch (error) {
+        return sendActionError(res, error, 'reschedule');
+    }
+});
+
+/**
+ * Push back/cancel a pre-confirmation appointment. selected_item_ids can be
+ * used to split and push back only part of the case.
+ */
+router.post('/appointments/pushback', authenticateTPA, async (req, res) => {
+    try {
+        const result = await TPAAppointmentActions.execute(
+            TPAAppointmentActions.ACTIONS.PUSHBACK,
+            req.body,
+            req.tpaContext,
+            getRequestId(req)
+        );
+        return res.json({
+            success: true,
+            message: result.scope === 'partial'
+                ? 'Selected tests split and pushed back successfully'
+                : 'Appointment pushed back successfully',
+            data: result
+        });
+    } catch (error) {
+        return sendActionError(res, error, 'push back');
+    }
+});
+
+/**
+ * Read-only appointment directory scoped to the authenticated TPA client.
+ * The returned test_items contain appointment_tests IDs for partial actions.
+ */
+router.get('/appointments', authenticateTPA, async (req, res) => {
+    try {
+        const result = await TPAAppointmentDirectory.search(
+            req.tpaContext.client_id,
+            req.query
+        );
+        return res.json({
+            success: true,
+            message: 'TPA appointments retrieved successfully',
+            data: result.data,
+            pagination: result.pagination
+        });
+    } catch (error) {
+        const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;
+        logger.error('Error getting TPA appointments', {
+            error: error.message,
+            clientId: req.tpaContext?.client_id
+        });
+        return res.status(statusCode).json({
+            success: false,
+            error: statusCode === 500 ? 'Failed to get appointments' : error.message
+        });
+    }
 });
 
 /**
@@ -368,7 +469,9 @@ router.post('/appointments', authenticateTPA, async (req, res) => {
         });
         res.status(statusCode).json({
             success: false,
-            error: 'Failed to create appointments',
+            error: error.code === 'ACTIVE_APPLICATION_NUMBER_EXISTS'
+                ? 'Active appointment exists for this application number'
+                : 'Failed to create appointments',
             message: error.message
         });
     }

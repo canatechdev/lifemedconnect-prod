@@ -10,6 +10,38 @@ const { createAppointment } = require('../appointments/AppointmentCRUD');
 
 class TPAAppointmentService {
     /**
+     * Master categories may store multiple report types as a JSON array, while
+     * tests store a single value. Keep the public TPA response simple and
+     * consistent for both forms.
+     */
+    static formatReportType(reportType) {
+        if (reportType === null || reportType === undefined || reportType === '') {
+            return null;
+        }
+
+        if (Array.isArray(reportType)) {
+            const values = reportType.map(value => String(value).trim()).filter(Boolean);
+            return values.length ? values.join(', ') : null;
+        }
+
+        const value = String(reportType).trim();
+        if (!value) {
+            return null;
+        }
+
+        try {
+            const parsed = JSON.parse(value);
+            if (Array.isArray(parsed)) {
+                return this.formatReportType(parsed);
+            }
+        } catch (_) {
+            // Tests commonly store a plain report type rather than JSON.
+        }
+
+        return value;
+    }
+
+    /**
      * Create single appointment from TPA
      */
     static async createAppointment(appointmentData, clientId) {
@@ -27,7 +59,9 @@ class TPAAppointmentService {
             mappedData.created_by = null; // TPA system creates these
 
             // Use standard appointment creation function
-            const result = await createAppointment(mappedData);
+            const result = await createAppointment(mappedData, null, {
+                allowReplacementAfterPushback: true
+            });
 
             logger.info('TPA appointment created', {
                 appointmentId: result,
@@ -115,7 +149,9 @@ class TPAAppointmentService {
         for (const validation of validationResults) {
             try {
                 validation.mappedData.created_by = null;
-                const result = await createAppointment(validation.mappedData);
+                const result = await createAppointment(validation.mappedData, null, {
+                    allowReplacementAfterPushback: true
+                });
                 results.success.push({
                     success: true,
                     appointment_id: result,
@@ -167,7 +203,8 @@ class TPAAppointmentService {
                 SELECT 
                     tc.id as category_id,
                     tc.category_name,
-                    tc.description
+                    tc.description,
+                    tc.report_type
                 FROM test_categories tc
                 WHERE tc.is_active = 1 AND tc.is_deleted = 0
             `;
@@ -193,6 +230,7 @@ class TPAAppointmentService {
                     category_id: row.category_id,
                     category_name: row.category_name,
                     description: row.description,
+                    report_type: this.formatReportType(row.report_type),
                     tests: []
                 };
             });
@@ -206,6 +244,7 @@ class TPAAppointmentService {
                             t.test_name,
                             t.test_code,
                             t.description as test_description,
+                            t.report_type,
                             t.test_category_id
                         FROM tests t
                         WHERE t.test_category_id IN (${Object.keys(categories).join(',')})
@@ -221,7 +260,8 @@ class TPAAppointmentService {
                                 test_id: row.test_id,
                                 test_name: row.test_name,
                                 test_code: row.test_code,
-                                description: row.test_description
+                                description: row.test_description,
+                                report_type: this.formatReportType(row.report_type)
                             });
                         }
                     });
@@ -474,7 +514,8 @@ class TPAAppointmentService {
                 SELECT 
                     tc.id,
                     tc.category_name,
-                    tc.description
+                    tc.description,
+                    tc.report_type
                 FROM test_categories tc
                 WHERE tc.is_active = 1 AND tc.is_deleted = 0
                 ORDER BY tc.category_name
@@ -486,7 +527,8 @@ class TPAAppointmentService {
                     t.id,
                     t.test_name,
                     t.test_code,
-                    t.description as test_description
+                    t.description as test_description,
+                    t.report_type
                 FROM tests t
                 WHERE t.is_active = 1 AND t.is_deleted = 0
                 ORDER BY t.test_name
@@ -496,7 +538,8 @@ class TPAAppointmentService {
             const formattedCategories = categories.map(category => ({
                 id: category.id,
                 name: category.category_name,
-                type: 'category'
+                type: 'category',
+                report_type: this.formatReportType(category.report_type)
                 // No rate for categories
             }));
 
@@ -504,7 +547,8 @@ class TPAAppointmentService {
             const formattedTests = tests.map(test => ({
                 id: test.id,
                 name: test.test_name,
-                type: 'test'
+                type: 'test',
+                report_type: this.formatReportType(test.report_type)
                 // No rate for tests
             }));
 
@@ -593,6 +637,7 @@ class TPAAppointmentService {
                     t.id,
                     t.test_name AS name,
                     'test' AS type,
+                    t.report_type,
                     COALESCE(btr.rate, 0) AS rate
                 FROM tests t
                 LEFT JOIN bulk_test_rates btr
@@ -612,6 +657,7 @@ class TPAAppointmentService {
                     tc.id,
                     tc.category_name AS name,
                     'category' AS type,
+                    tc.report_type,
                     COALESCE(btr.rate, 0) AS rate
                 FROM test_categories tc
                 LEFT JOIN bulk_test_rates btr
@@ -633,6 +679,7 @@ class TPAAppointmentService {
                         t.id,
                         t.test_name AS name,
                         'test' AS type,
+                        t.report_type,
                         0 AS rate
                     FROM tests t
                     WHERE t.is_active = TRUE
@@ -645,6 +692,7 @@ class TPAAppointmentService {
                         tc.id,
                         tc.category_name AS name,
                         'category' AS type,
+                        tc.report_type,
                         0 AS rate
                     FROM test_categories tc
                     WHERE tc.is_active = TRUE
@@ -654,8 +702,14 @@ class TPAAppointmentService {
             }
 
             return {
-                tests,
-                categories
+                tests: tests.map(test => ({
+                    ...test,
+                    report_type: this.formatReportType(test.report_type)
+                })),
+                categories: categories.map(category => ({
+                    ...category,
+                    report_type: this.formatReportType(category.report_type)
+                }))
             };
 
         } catch (error) {

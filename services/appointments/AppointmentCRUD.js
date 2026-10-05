@@ -225,7 +225,7 @@ async function updateAppointmentStatus(appointmentId) {
 /**
  * Create new appointment with tests
  */
-async function createAppointment(row, connection = null) {
+async function createAppointment(row, connection = null, options = {}) {
     const useOwnConnection = !connection;
     const conn = connection || await db.pool.getConnection();
 
@@ -234,17 +234,36 @@ async function createAppointment(row, connection = null) {
             await conn.beginTransaction();
         }
 
-        // check duplicate app no
+        // Keep the standard application-number guard for CRM and Excel imports.
+        // TPA retries may create a replacement only after every active matching
+        // appointment has been pushed back.
         if (row.application_number) {
             const [existing] = await conn.query(
-                `SELECT id FROM appointments 
-             WHERE application_number = ? AND is_deleted = 0 
-             LIMIT 1`,
+                `SELECT id, status, medical_status, pushed_back
+                 FROM appointments
+                 WHERE application_number = ? AND is_deleted = 0
+                 FOR UPDATE`,
                 [row.application_number]
             );
 
             if (existing && existing.length > 0) {
-                throw new Error('An active appointment already exists with this application number.');
+                const allowReplacementAfterPushback = options.allowReplacementAfterPushback === true;
+                const allPushedBack = existing.every((appointment) => (
+                    Number(appointment.pushed_back) === 1
+                    || String(appointment.status || '').toLowerCase() === 'pushed_back'
+                    || String(appointment.medical_status || '').toLowerCase() === 'pushed_back'
+                ));
+
+                if (!allowReplacementAfterPushback || !allPushedBack) {
+                    const error = new Error(
+                        allowReplacementAfterPushback
+                            ? 'An active appointment already exists with this application number and is not pushed back. Push it back before creating a new appointment with the same application number.'
+                            : 'An active appointment already exists with this application number.'
+                    );
+                    error.statusCode = 409;
+                    error.code = 'ACTIVE_APPLICATION_NUMBER_EXISTS';
+                    throw error;
+                }
             }
         }
 

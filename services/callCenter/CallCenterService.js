@@ -2,6 +2,7 @@ const axios = require('axios');
 const { getDistance } = require('geolib');
 const db = require('../../lib/dbconnection');
 const logger = require('../../lib/logger');
+const pincodeService = require('./CallCenterPincodeService');
 
 // One customer origin x 50 nearby centers gives planners a useful comparison
 // while keeping each Google matrix request bounded and predictable.
@@ -117,6 +118,21 @@ function postalCodeFromResult(candidate) {
     return normalizePincode(postalComponent?.long_name);
 }
 
+function cityFromResult(candidate) {
+    const components = candidate?.address_components || [];
+    const preferredTypes = [
+        'locality',
+        'postal_town',
+        'administrative_area_level_3',
+        'administrative_area_level_2',
+    ];
+    for (const type of preferredTypes) {
+        const component = components.find((item) => Array.isArray(item.types) && item.types.includes(type));
+        if (component?.long_name) return component.long_name;
+    }
+    return null;
+}
+
 async function reverseGeocodePincode(latitude, longitude) {
     const cacheKey = `reverse:${Number(latitude).toFixed(5)},${Number(longitude).toFixed(5)}`;
     const cached = getCachedLocation(cacheKey);
@@ -156,6 +172,7 @@ async function geocodeLocation(input) {
                 latitude,
                 longitude,
                 pincode,
+                city: null,
                 approximate: false,
             };
         }
@@ -202,18 +219,27 @@ async function geocodeLocation(input) {
         latitude: result.geometry.location.lat,
         longitude: result.geometry.location.lng,
         pincode: resolvedPincode,
+        city: cityFromResult(result),
         approximate: pincodeOnly || result.partial_match || locationType === 'APPROXIMATE',
     });
 }
 
-async function getEligibleCenters() {
+async function getEligibleCenters(centerIds = null) {
+    const ids = Array.isArray(centerIds) ? centerIds.map(Number).filter(Number.isInteger) : [];
+    const conditions = ['is_deleted = 0'];
+    const params = [];
+    if (ids.length) {
+        conditions.push(`id IN (${ids.map(() => '?').join(',')})`);
+        params.push(...ids);
+    }
+    if (Array.isArray(centerIds) && !ids.length) return [];
     return db.query(`
         SELECT id, center_name, address, city, state, pincode,
                gps_latitude, gps_longitude, service_radius_km, extra_charge_per_km
         FROM diagnostic_centers
-        WHERE is_deleted = 0
+        WHERE ${conditions.join(' AND ')}
         ORDER BY center_name ASC
-    `);
+    `, params);
 }
 
 async function getTechniciansForPincode(pincode) {
@@ -506,7 +532,124 @@ async function getGoogleRoadDistances(origin, centers) {
     return routes;
 }
 
-async function searchPlanner(input) {
+async function getDecoratedTechnicians(pincode, appointmentDate, availabilityEndDate, availabilityDates, gender) {
+    const technicians = await getTechniciansForPincode(pincode);
+    const technicianIds = technicians.map((technician) => Number(technician.id));
+    const [unavailability, assignments] = await Promise.all([
+        getUnavailability(technicianIds, appointmentDate, availabilityEndDate, availabilityDates),
+        getDailyAssignments(technicianIds, appointmentDate, availabilityEndDate),
+    ]);
+    return technicians.map((technician) => (
+        decorateTechnician(
+            technician,
+            assignments,
+            unavailability,
+            appointmentDate,
+            availabilityDates,
+            gender,
+        )
+    ));
+}
+
+function rankCenters(centers) {
+    return centers
+        .sort((a, b) => (
+            Number(b.available_technicians > 0) - Number(a.available_technicians > 0)
+            || Number(b.within_radius) - Number(a.within_radius)
+            || (a.estimated_extra_charge ?? Number.POSITIVE_INFINITY) - (b.estimated_extra_charge ?? Number.POSITIVE_INFINITY)
+            || (a.distance_km ?? Number.POSITIVE_INFINITY) - (b.distance_km ?? Number.POSITIVE_INFINITY)
+            || a.center_name.localeCompare(b.center_name)
+        ))
+        .map((center, index) => ({ ...center, rank: index + 1, recommended: index === 0 }));
+}
+
+async function searchConfiguredPincode(input, pricing) {
+    const today = getIndiaDate();
+    const appointmentDate = normalizeDate(input.appointment_date) || today;
+    if (appointmentDate < today) throw operationalError('Availability can only be planned from today onwards.', 400);
+    const availabilityDates = buildDateRange(appointmentDate, AVAILABILITY_LOOKAHEAD_DAYS);
+    const availabilityEndDate = availabilityDates[availabilityDates.length - 1];
+    const [mappedCenters, decoratedTechnicians] = await Promise.all([
+        getEligibleCenters(pricing.center_ids),
+        getDecoratedTechnicians(pricing.pincode, appointmentDate, availabilityEndDate, availabilityDates, input.gender),
+    ]);
+    const pricingByCenter = new Map(
+        (pricing.center_pricing || []).map((item) => [Number(item.center_id), item]),
+    );
+    const mappedCoordinates = mappedCenters
+        .filter((center) => center.gps_latitude !== null && center.gps_longitude !== null)
+        .map((center) => ({ latitude: toNumber(center.gps_latitude), longitude: toNumber(center.gps_longitude) }))
+        .filter((point) => Number.isFinite(point.latitude) && Number.isFinite(point.longitude));
+    const fallbackLatitude = mappedCoordinates.length
+        ? mappedCoordinates.reduce((sum, point) => sum + point.latitude, 0) / mappedCoordinates.length
+        : null;
+    const fallbackLongitude = mappedCoordinates.length
+        ? mappedCoordinates.reduce((sum, point) => sum + point.longitude, 0) / mappedCoordinates.length
+        : null;
+    const availableTechnicians = decoratedTechnicians.filter((technician) => technician.available).length;
+    const centers = rankCenters(mappedCenters.map((center) => {
+        const centerPricing = pricingByCenter.get(Number(center.id)) || pricing;
+        const oneWayDistance = centerPricing.average_one_way_distance_km;
+        const roundTripDistance = oneWayDistance === null ? null : Number((oneWayDistance * 2).toFixed(2));
+        const isFree = centerPricing.charge_type === 'free';
+        const perKmRate = round(Math.max(0, toNumber(center.extra_charge_per_km)), 2);
+        return {
+        id: Number(center.id),
+        center_name: center.center_name,
+        address: center.address,
+        city: center.city,
+        state: center.state,
+        pincode: center.pincode,
+        latitude: center.gps_latitude === null ? null : toNumber(center.gps_latitude),
+        longitude: center.gps_longitude === null ? null : toNumber(center.gps_longitude),
+        distance_km: oneWayDistance,
+        distance_source: 'configured_pincode',
+        duration_minutes: null,
+        service_radius_km: round(Math.max(0, toNumber(center.service_radius_km)), 2),
+        extra_distance_km: null,
+        charge_distance_km: roundTripDistance,
+        estimated_extra_charge: isFree || roundTripDistance === null ? 0 : round(roundTripDistance * perKmRate, 2),
+        within_radius: isFree,
+        charge_type: centerPricing.charge_type,
+        extra_charge_per_km: perKmRate,
+        pricing_source: 'configured_pincode',
+        available_technicians: availableTechnicians,
+        total_technicians: decoratedTechnicians.length,
+        technicians: decoratedTechnicians,
+        };
+    }));
+
+    return {
+        location: {
+            input: pricing.pincode,
+            formatted_address: pricing.formatted_address || `${pricing.city}, ${pricing.pincode}, India`,
+            // A manually configured pincode may not have its own geocoded point.
+            // Use the mapped DC centroid only to frame the free Leaflet preview;
+            // the stored pincode distance remains the customer-facing value.
+            latitude: pricing.latitude ?? fallbackLatitude,
+            longitude: pricing.longitude ?? fallbackLongitude,
+            pincode: pricing.pincode,
+            city: pricing.city,
+            approximate: pricing.latitude === null || pricing.longitude === null,
+        },
+        search: { availability_end_date: availabilityEndDate, mode: 'saved_pincode' },
+        summary: {
+            centers_evaluated: centers.length,
+            available_technicians: new Set(centers.flatMap((center) => center.technicians.filter((technician) => technician.available).map((technician) => technician.id))).size,
+            centers_within_radius: pricing.charge_type === 'free' ? centers.length : 0,
+            unmapped_centers: 0,
+        },
+        pincode_pricing: pricing,
+        pincode_configured: true,
+        can_save_pincode: false,
+        warning: centers.length
+            ? null
+            : 'This pincode is configured, but no linked diagnostic center is currently available.',
+        centers,
+    };
+}
+
+async function searchLivePlanner(input) {
     const today = getIndiaDate();
     const appointmentDate = normalizeDate(input.appointment_date) || today;
     if (appointmentDate < today) {
@@ -542,22 +685,13 @@ async function searchPlanner(input) {
         ? `${mappedCenters.length - routableCenters.length} center(s) were omitted because Google Routes returned no drivable route.`
         : null;
 
-    const technicians = await getTechniciansForPincode(location.pincode);
-    const technicianIds = technicians.map((technician) => Number(technician.id));
-    const [unavailability, assignments] = await Promise.all([
-        getUnavailability(technicianIds, appointmentDate, availabilityEndDate, availabilityDates),
-        getDailyAssignments(technicianIds, appointmentDate, availabilityEndDate),
-    ]);
-    const decoratedTechnicians = technicians.map((technician) => (
-        decorateTechnician(
-            technician,
-            assignments,
-            unavailability,
-            appointmentDate,
-            availabilityDates,
-            input.gender,
-        )
-    ));
+    const decoratedTechnicians = await getDecoratedTechnicians(
+        location.pincode,
+        appointmentDate,
+        availabilityEndDate,
+        availabilityDates,
+        input.gender,
+    );
 
     const centers = routableCenters.map((center) => {
         const route = roadDistances.get(Number(center.id));
@@ -580,35 +714,64 @@ async function searchPlanner(input) {
             distance_source: 'google_routes',
             duration_minutes: route?.duration_minutes ?? null,
             ...calculateCenterCost(center, distanceKm),
+            charge_type: null,
+            pricing_source: 'live_route',
             available_technicians: availableTechnicians,
             total_technicians: centerTechnicians.length,
             technicians: centerTechnicians,
         };
-    }).sort((a, b) => (
-        Number(b.available_technicians > 0) - Number(a.available_technicians > 0)
-        || Number(b.within_radius) - Number(a.within_radius)
-        || (a.estimated_extra_charge ?? Number.POSITIVE_INFINITY) - (b.estimated_extra_charge ?? Number.POSITIVE_INFINITY)
-        || (a.distance_km ?? Number.POSITIVE_INFINITY) - (b.distance_km ?? Number.POSITIVE_INFINITY)
-    )).map((center, index) => ({ ...center, rank: index + 1, recommended: index === 0 }));
+    });
+    const rankedCenters = rankCenters(centers);
+    const savedPincode = await pincodeService.getActiveByPincode(location.pincode);
 
     return {
         location,
         search: {
             availability_end_date: availabilityEndDate,
+            mode: 'live_location',
         },
         summary: {
-            centers_evaluated: centers.length,
-            available_technicians: new Set(centers.flatMap((center) => (
+            centers_evaluated: rankedCenters.length,
+            available_technicians: new Set(rankedCenters.flatMap((center) => (
                 center.technicians
                     .filter((technician) => technician.available)
                     .map((technician) => technician.id)
             ))).size,
-            centers_within_radius: centers.filter((center) => center.within_radius).length,
+            centers_within_radius: rankedCenters.filter((center) => center.within_radius).length,
             unmapped_centers: allCenters.length - allCenters.filter((center) => center.gps_latitude !== null && center.gps_longitude !== null).length,
         },
+        pincode_pricing: savedPincode,
+        pincode_configured: Boolean(savedPincode),
+        can_save_pincode: !savedPincode,
         warning: routeWarning,
-        centers,
+        centers: rankedCenters,
     };
+}
+
+async function searchPlanner(input) {
+    const hasAddressSearch = Boolean(String(input.address || '').trim() || String(input.landmark || '').trim());
+    const liveSearch = input.search_mode === 'live_location' || hasAddressSearch
+        || (input.latitude !== undefined && input.longitude !== undefined);
+    const pincode = normalizePincode(input.pincode);
+
+    if (!liveSearch) {
+        if (!pincode) throw operationalError('Enter a valid six-digit pincode to search saved Call Center mappings.', 400);
+        const pricing = await pincodeService.getActiveByPincode(pincode);
+        if (!pricing) {
+            return {
+                location: { input: pincode, formatted_address: null, latitude: null, longitude: null, pincode, city: null, approximate: true },
+                search: { availability_end_date: null, mode: 'saved_pincode' },
+                summary: { centers_evaluated: 0, available_technicians: 0, centers_within_radius: 0, unmapped_centers: 0 },
+                pincode_pricing: null,
+                pincode_configured: false,
+                can_save_pincode: false,
+                warning: 'This pincode is not configured. Use Live Location Search to find and save it.',
+                centers: [],
+            };
+        }
+        return searchConfiguredPincode(input, pricing);
+    }
+    return searchLivePlanner(input);
 }
 
 async function getSummary(appointmentDate) {
