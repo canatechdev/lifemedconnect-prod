@@ -188,6 +188,7 @@ const tpaRoutes = require('./routes/r_tpa');
 const tpaManagementRoutes = require('./routes/r_tpa_management');
 const storageBackupRoutes = require('./routes/r_storage_backup');
 const callCenterRoutes = require('./routes/r_call_center');
+const systemLogsRoutes = require('./routes/r_system_logs');
 
 // Health check route
 app.get('/', (req, res) => {
@@ -260,6 +261,7 @@ app.use('/api/tpa', tpaRoutes);
 app.use('/api/tpa-management', tpaManagementRoutes);
 app.use('/api', storageBackupRoutes);
 app.use('/api/call-center', callCenterRoutes);
+app.use('/api', systemLogsRoutes);
 
 // SPA Fallback: Serve index.html for all non-API routes (production only)
 // This allows React Router to handle client-side routing
