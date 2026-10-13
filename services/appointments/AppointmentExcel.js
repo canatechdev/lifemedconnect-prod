@@ -208,7 +208,7 @@ async function generateTemplate() {
         // Add title
         let currentRow = 1;
         worksheet.getRow(currentRow).values = ['APPOINTMENTS UPLOAD TEMPLATE'];
-        worksheet.mergeCells(`A${currentRow}:N${currentRow}`);
+        worksheet.mergeCells(`A${currentRow}:O${currentRow}`);
         worksheet.getCell(`A${currentRow}`).font = { bold: true, size: 16 };
         worksheet.getCell(`A${currentRow}`).alignment = { horizontal: 'center' };
         currentRow++;
@@ -240,7 +240,7 @@ async function generateTemplate() {
         const headerRow = currentRow;
         worksheet.getRow(headerRow).values = [
             'Application Number*', 'TPA', 'Insurer', 'Customer First Name', 'Customer Last Name',
-            'Gender', 'Customer Mobile', 'Customer Alt No', 'Customer Service No', 'Customer Email', 'Customer Category',
+            'Gender', 'Customer Mobile', 'Customer Alt No', 'Customer Service No', 'Customer Email', 'Customer Category', 'Medical Type',
             'Appointment Date* (YYYY-MM-DD)', 'Appointment Time (HH:MM:SS)', 'Visit Type',
             'Landmark', 'State', 'City', 'Pin Code', 'Country', 'Customer Address', 'Remarks'
         ];
@@ -254,7 +254,7 @@ async function generateTemplate() {
         };
 
         // Set column widths
-        const colWidths = [20, 25, 25, 20, 20, 15, 15, 15, 15, 25, 20, 20, 15, 20, 20, 20, 15, 10, 30, 20, 30];
+        const colWidths = [20, 25, 25, 20, 20, 15, 15, 15, 15, 25, 20, 18, 20, 15, 20, 20, 20, 15, 10, 30, 20, 30];
         for (let c = 1; c <= colWidths.length; c++) {
             worksheet.getColumn(c).width = colWidths[c - 1];
         }
@@ -312,8 +312,17 @@ async function generateTemplate() {
                 error: 'Please select from: Non_HNI, SUPER_HNI, HNI'
             };
 
-            // Visit Type dropdown (Column N)
-            worksheet.getCell(`N${row}`).dataValidation = {
+            worksheet.getCell(`L${row}`).dataValidation = {
+                type: 'list',
+                allowBlank: true,
+                formulae: ['"Fasting,Non-Fasting"'],
+                showErrorMessage: true,
+                errorTitle: 'Invalid Medical Type',
+                error: 'Please select Fasting or Non-Fasting'
+            };
+
+            // Visit Type dropdown (Column O)
+            worksheet.getCell(`O${row}`).dataValidation = {
                 type: 'list',
                 allowBlank: true,
                 formulae: [`"${visitTypeOptions.join(',')}"`],
@@ -332,7 +341,7 @@ async function generateTemplate() {
             'APP-001',
             clients.length > 0 ? clients[0].client_name : '',
             insurers.length > 0 ? insurers[0].insurer_name : '',
-            'John', 'Doe', 'Male', '9876543210','','','john.doe@email.com', 'Non_HNI',
+            'John', 'Doe', 'Male', '9876543210','','','john.doe@email.com', 'Non_HNI', 'Fasting',
             '2024-01-15', '09:00:00', 'Home_Visit', 'Near Mall Road', 'Delhi', 'New Delhi',
             '110001', 'IN', '123 Main Street, XYZ Building', 'Initial appointment'
         ];
@@ -359,6 +368,13 @@ async function generateTemplate() {
 function cleanValue(value) {
     if (value === undefined || value === null || value === '') return null;
     return String(value).trim();
+}
+
+function normalizeMedicalType(value) {
+    const normalized = String(value ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+    if (!normalized) return null;
+    if (normalized === 'fasting' || normalized === 'non_fasting') return normalized;
+    return normalized;
 }
 
 /**
@@ -458,7 +474,7 @@ async function processUploadedFile(filePath, user) {
                 'customer_alt_mobile',
                 'customer_service_no',
                 'customer_email',
-                'customer_category',
+                'customer_category', 'medical_type',
                 'appointment_date',
                 'appointment_time',
                 'visit_type',
@@ -538,6 +554,7 @@ async function processUploadedFile(filePath, user) {
                     customer_service_no: cleanValue(row.customer_service_no),
                     customer_email: cleanValue(row.customer_email),
                     customer_category: cleanValue(row.customer_category) || 'Non_HNI',
+                    medical_type: normalizeMedicalType(row.medical_type),
                     appointment_date: parseExcelDate(row.appointment_date),
                     appointment_time: cleanTimeValue(row.appointment_time),
                     visit_type: cleanValue(row.visit_type) || 'Home_Visit',
@@ -669,13 +686,13 @@ async function getAppointmentsForExport(filters = {}, user = null) {
             params.push(user.client_id);
         }
         if (user?.technician_id || user?.assigned_technician_id) {
-            const technicianId = user.technician_id || user.assigned_technician_id;
+            const scopedTechnicianId = user.technician_id || user.assigned_technician_id;
             conditions.push(`EXISTS (
                 SELECT 1 FROM appointment_tests scope_at
                 WHERE scope_at.appointment_id = a.id
                   AND scope_at.assigned_technician_id = ?
             )`);
-            params.push(technicianId);
+            params.push(scopedTechnicianId);
         }
 
         // Clean Date Filtering: Only use dateField + rangeType (no legacy filters)
@@ -717,6 +734,7 @@ async function getAppointmentsForExport(filters = {}, user = null) {
             conditions.push('a.qc_status = ?');
             params.push(qcStatus);
         }
+
 
         // Diagnostic Center Filtering: Filter by center_id OR other_center_id (multiple centers support)
         if (centerIds && centerIds.length > 0) {
@@ -867,7 +885,7 @@ async function generateExportExcel(appointments, filters = {}) {
             'Case Number', 'Application Number', 'Client', 'Center', 'Other Center', 'Insurer',
             'Customer First Name', 'Customer Last Name', 'Gender', 'Mobile', 'Alt Mobile', 'Service No',
             'Email', 'Address', 'State', 'City', 'Pincode', 'Country', 'Landmark',
-            'Visit Type', 'Customer Category', 'Appointment Date', 'Confirmed Date', 'Appointment Time', 
+            'Visit Type', 'Customer Category', 'Medical Type', 'Appointment Date', 'Confirmed Date', 'Appointment Time',
             'Confirmed Time', 'Status', 'Medical Status', 'QC Status',
             'Cost Type', 'UTR Number', 'Amount',
             'Test Count', 'Categories', 'Tests', 'Assigned Technicians',
@@ -913,6 +931,7 @@ async function generateExportExcel(appointments, filters = {}) {
                 apt.customer_landmark,
                 apt.visit_type,
                 apt.customer_category,
+                apt.medical_type === 'non_fasting' ? 'Non-Fasting' : apt.medical_type === 'fasting' ? 'Fasting' : '',
                 apt.appointment_date ? new Date(apt.appointment_date).toLocaleDateString('en-IN') : '',
                 apt.confirmed_date ? new Date(apt.confirmed_date).toLocaleDateString('en-IN') : '',
                 apt.appointment_time || '',

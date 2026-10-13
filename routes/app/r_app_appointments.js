@@ -469,7 +469,7 @@ router.post('/appointments/:id/medical-status',
     async (req, res) => {
         try {
             const appointmentId = parseInt(req.params.id, 10);
-            const { medical_status, medical_remarks, aadhaar_number, pan_number, pending_report_types } = req.body || {};
+            const { medical_status, medical_remarks, aadhaar_number, pan_number, pending_report_types, medical_type } = req.body || {};
 
             if (Number.isNaN(appointmentId)) {
                 return ApiResponse.appError(res, 'Invalid appointment id', 400);
@@ -482,6 +482,13 @@ router.post('/appointments/:id/medical-status',
             const allowed = ['arrived', 'in_process', 'partially_completed', 'completed'];
             if (!allowed.includes(medical_status)) {
                 return ApiResponse.appError(res, `medical_status must be one of: ${allowed.join(', ')}`, 400);
+            }
+
+            const normalizedMedicalType = medical_type === undefined || medical_type === null || medical_type === ''
+                ? undefined
+                : String(medical_type).trim().toLowerCase().replace(/[\s-]+/g, '_');
+            if (normalizedMedicalType !== undefined && !['fasting', 'non_fasting'].includes(normalizedMedicalType)) {
+                return ApiResponse.appError(res, 'medical_type must be fasting or non_fasting', 400);
             }
 
             if (medical_status === 'partially_completed' && !pending_report_types) {
@@ -528,7 +535,8 @@ router.post('/appointments/:id/medical-status',
                         aadhaar_number: aadhaar_number || null,
                         pan_number: pan_number || null,
                         medical_remarks: medical_remarks || null,
-                        pending_report_types: pendingTypesArray
+                        pending_report_types: pendingTypesArray,
+                        medical_type: normalizedMedicalType
                     },
                     req.user.id,
                     actorContext
@@ -594,7 +602,8 @@ router.post('/appointments/:id/medical-status',
                     medical_remarks: medical_remarks || null,
                     aadhaar_number: aadhaar_number || null,
                     pan_number: pan_number || null,
-                    pending_report_types: pendingTypesArray
+                    pending_report_types: pendingTypesArray,
+                    medical_type: normalizedMedicalType
                 },
                 req.user.id,
                 actorContext

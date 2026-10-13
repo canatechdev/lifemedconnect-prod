@@ -328,6 +328,8 @@ async function getCaseTracker({ user, searchTerm, baseUrl }) {
             visit_type_label: titleCaseStatus(appointment.visit_type),
             customer_category: appointment.customer_category,
             customer_category_label: formatCustomerCategory(appointment.customer_category),
+            medical_type: appointment.medical_type || null,
+            medical_type_label: appointment.medical_type === 'non_fasting' ? 'Non-Fasting' : appointment.medical_type === 'fasting' ? 'Fasting' : null,
             amount: appointment.amount,
             cost_type: appointment.cost_type,
             amount_label: formatCurrencyDisplay(appointment.amount, appointment.cost_type),

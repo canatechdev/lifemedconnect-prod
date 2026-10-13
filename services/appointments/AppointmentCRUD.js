@@ -287,7 +287,7 @@ async function createAppointment(row, connection = null, options = {}) {
                 customer_first_name, customer_last_name, gender, customer_mobile, customer_alt_mobile, customer_service_no,
                 customer_email, customer_address, state, city, pincode, country,
                 customer_gps_latitude, customer_gps_longitude, customer_landmark,
-                visit_type, customer_category, appointment_date, appointment_time, confirmed_time,
+                visit_type, customer_category, medical_type, appointment_date, appointment_time, confirmed_time,
                 status, assigned_technician_id, assigned_at, assigned_by,
                 customer_arrived_at, medical_started_at, medical_completed_at,
                 remarks, cancellation_reason, created_by,
@@ -295,7 +295,7 @@ async function createAppointment(row, connection = null, options = {}) {
                 created_at, updated_at, is_active, split_type
             )
             VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 1, 'none'
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 1, 'none'
             )
         `;
 
@@ -312,7 +312,7 @@ async function createAppointment(row, connection = null, options = {}) {
             safe(row.customer_mobile), safe(row.customer_alt_mobile), safe(row.customer_service_no), safe(row.customer_email),
             safe(row.customer_address), safe(row.state), safe(row.city), safe(row.pincode),
             safe(row.country), safe(row.customer_gps_latitude), safe(row.customer_gps_longitude),
-            safe(row.customer_landmark), safe(row.visit_type), safe(row.customer_category),
+            safe(row.customer_landmark), safe(row.visit_type), safe(row.customer_category), safe(row.medical_type),
             safe(row.appointment_date), safe(row.appointment_time), safe(row.confirmed_time),
             safe(initialStatus), safe(row.assigned_technician_id),
             safe(row.assigned_at), safe(row.assigned_by), safe(row.customer_arrived_at),
@@ -434,7 +434,7 @@ async function cloneAppointment(sourceAppointmentId, userId = null) {
                 customer_first_name, customer_last_name, gender, customer_mobile, customer_alt_mobile, customer_service_no,
                 customer_email, customer_address, state, city, pincode, country,
                 customer_gps_latitude, customer_gps_longitude, customer_landmark,
-                visit_type, customer_category, appointment_date, confirmed_date, appointment_time, confirmed_time,
+                visit_type, customer_category, medical_type, appointment_date, confirmed_date, appointment_time, confirmed_time,
                 status, assigned_technician_id, assigned_at, assigned_by,
                 customer_arrived_at, medical_started_at, medical_completed_at,
                 remarks, cancellation_reason, created_by, created_at, updated_at, is_deleted,
@@ -449,7 +449,7 @@ async function cloneAppointment(sourceAppointmentId, userId = null) {
                 last_call_attempt_at, total_call_attempts
             )
             VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL,
                 'pending', ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, NOW(), NOW(), 0,
                 0, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL,
                 NULL, NULL, NULL, NULL, NULL, NULL,
@@ -486,6 +486,7 @@ async function cloneAppointment(sourceAppointmentId, userId = null) {
             safe(source.customer_landmark),
             safe(source.visit_type),
             safe(source.customer_category),
+            safe(source.medical_type),
             safe(source.appointment_date),
             safe(source.appointment_time),
             safe(source.assigned_technician_id),

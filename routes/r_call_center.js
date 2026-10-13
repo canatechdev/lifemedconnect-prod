@@ -34,11 +34,15 @@ const pincodeMappingSchema = Joi.object({
     charge_type: Joi.string().valid('free', 'paid', 'Free', 'Paid').required(),
     average_one_way_distance_km: Joi.number().min(0).allow(null, '').optional(),
     average_additional_cost: Joi.number().min(0).allow(null, '').optional(),
+    center_mappings: Joi.array().items(Joi.object({
+        center_id: Joi.number().integer().positive().required(),
+        per_km_rate_override: Joi.number().min(0).allow(null, '').optional(),
+    })).optional(),
     formatted_address: Joi.string().trim().max(2000).allow('', null).optional(),
     latitude: Joi.number().min(-90).max(90).allow(null).optional(),
     longitude: Joi.number().min(-180).max(180).allow(null).optional(),
-    center_ids: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
-});
+    center_ids: Joi.array().items(Joi.number().integer().positive()).min(1).optional(),
+}).or('center_ids', 'center_mappings');
 
 router.get('/summary', verifyToken, requirePermission('call_center.view'), asyncHandler(async (req, res) => {
     const data = await service.getSummary(req.query.date);

@@ -690,7 +690,7 @@ async function updateMedicalStatus(appointmentId, newStatus, additionalData, use
         });
 
         const [current] = await connection.query(
-            'SELECT status, medical_status, aadhaar_number, pan_number, medical_remarks, visit_type, center_id, other_center_id, pending_report_types, center_medical_status, home_medical_status, center_confirmed_at, home_confirmed_at FROM appointments WHERE id = ?',
+            'SELECT status, medical_status, medical_type, aadhaar_number, pan_number, medical_remarks, visit_type, center_id, other_center_id, pending_report_types, center_medical_status, home_medical_status, center_confirmed_at, home_confirmed_at FROM appointments WHERE id = ?',
             [appointmentId]
         );
 
@@ -723,7 +723,8 @@ async function updateMedicalStatus(appointmentId, newStatus, additionalData, use
                 additionalData.aadhaar_number !== undefined ||
                 additionalData.pan_number !== undefined ||
                 additionalData.medical_remarks !== undefined ||
-                additionalData.pending_report_types !== undefined
+                additionalData.pending_report_types !== undefined ||
+                additionalData.medical_type !== undefined
             )
         );
 
@@ -901,6 +902,10 @@ async function updateMedicalStatus(appointmentId, newStatus, additionalData, use
             if (additionalData.medical_remarks !== undefined) {
                 updateFields.push('medical_remarks = ?');
                 updateValues.push(additionalData.medical_remarks);
+            }
+            if (additionalData.medical_type !== undefined) {
+                updateFields.push('medical_type = ?');
+                updateValues.push(additionalData.medical_type);
             }
         }
 

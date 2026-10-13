@@ -95,7 +95,7 @@ async function updateAppointmentBasicFields(connection, id, row) {
         'customer_first_name', 'customer_last_name', 'gender', 'customer_mobile', 'customer_alt_mobile', 'customer_service_no',
         'customer_email', 'customer_address', 'state', 'city', 'pincode', 'country',
         'customer_gps_latitude', 'customer_gps_longitude', 'customer_landmark',
-        'visit_type', 'customer_category', 'appointment_date', 'appointment_time', 'confirmed_time',
+        'visit_type', 'customer_category', 'medical_type', 'appointment_date', 'appointment_time', 'confirmed_time',
         'status', 'assigned_technician_id', 'assigned_at', 'assigned_by',
         'customer_arrived_at', 'medical_started_at', 'medical_completed_at',
         'remarks', 'cancellation_reason', 'updated_by', 'cost_type', 'amount', 'utr_number', 'case_severity'

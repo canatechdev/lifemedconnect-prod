@@ -228,6 +228,7 @@ async function listAppointments({ userId, page = 1, limit = 10, search = '', upc
             a.insurer_id,
             i.insurer_name,
             a.visit_type,
+            a.medical_type,
             DATE_FORMAT(a.appointment_date, '%d-%m-%Y') AS appointment_date,
             CASE
                 WHEN a.appointment_time REGEXP '^[0-9]{2}:[0-9]{2}:[0-9]{2}$'
@@ -375,6 +376,7 @@ async function getAppointmentDetails({ userId, appointmentId }) {
             a.insurer_id,
             i.insurer_name,
             a.visit_type,
+            a.medical_type,
             DATE_FORMAT(a.appointment_date, '%d-%m-%Y') AS appointment_date,
             CASE
                 WHEN a.appointment_time REGEXP '^[0-9]{2}:[0-9]{2}:[0-9]{2}$'

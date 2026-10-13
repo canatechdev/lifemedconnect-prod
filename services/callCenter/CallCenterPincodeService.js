@@ -35,6 +35,22 @@ function parseCenterIds(values) {
     return [...new Set(list.map(Number).filter((id) => Number.isInteger(id) && id > 0))];
 }
 
+function parseCenterMappings(payload) {
+    const supplied = Array.isArray(payload.center_mappings) ? payload.center_mappings : [];
+    const mappings = supplied.length
+        ? supplied.map((item) => ({
+            centerId: Number(item?.center_id),
+            perKmRateOverride: toOptionalNumber(item?.per_km_rate_override),
+        }))
+        : parseCenterIds(payload.center_ids).map((centerId) => ({ centerId, perKmRateOverride: null }));
+    const seen = new Set();
+    return mappings.filter((item) => {
+        if (!Number.isInteger(item.centerId) || item.centerId <= 0 || seen.has(item.centerId)) return false;
+        seen.add(item.centerId);
+        return true;
+    });
+}
+
 function cellText(cell) {
     if (!cell || cell.value === null || cell.value === undefined) return '';
     return normalizeText(cell.text || cell.value);
@@ -53,17 +69,18 @@ async function getCentersByIds(connection, centerIds) {
 }
 
 async function insertPincodeRows(connection, input, userId) {
-    if (!input.centerIds.length) return;
-    const values = input.centerIds.map((centerId) => [
-        input.pincode, centerId, input.city, input.chargeType,
+    if (!input.centerMappings.length) return;
+    const values = input.centerMappings.map((mapping) => [
+        input.pincode, mapping.centerId, input.city, input.chargeType,
         input.averageOneWayDistanceKm, input.averageAdditionalCost,
+        input.chargeType === 'free' ? 0 : mapping.perKmRateOverride,
         input.formattedAddress, input.latitude, input.longitude,
         userId || null, userId || null,
     ]);
     await connection.query(
         `INSERT INTO call_center_pincode_pricing
          (pincode, center_id, city, charge_type, average_one_way_distance_km,
-          average_additional_cost, formatted_address, latitude, longitude,
+          average_additional_cost, per_km_rate_override, formatted_address, latitude, longitude,
           created_by, updated_by, created_at, updated_at, is_deleted)
          VALUES ?`,
         [values.map((value) => [...value, new Date(), new Date(), 0])],
@@ -86,7 +103,7 @@ class CallCenterPincodeService {
         if (!normalizedPincode) return null;
         const rows = await db.query(
             `SELECT p.id, p.pincode, p.center_id, p.city, p.charge_type,
-                    p.average_one_way_distance_km, p.average_additional_cost,
+                    p.average_one_way_distance_km, p.average_additional_cost, p.per_km_rate_override,
                     p.formatted_address, p.latitude, p.longitude,
                     p.created_at, p.updated_at
              FROM call_center_pincode_pricing p
@@ -121,6 +138,7 @@ class CallCenterPincodeService {
             average_one_way_distance_km: oneWay,
             average_round_trip_distance_km: oneWay === null ? null : Number((oneWay * 2).toFixed(2)),
             average_additional_cost: toOptionalNumber(row.average_additional_cost) || 0,
+            per_km_rate_override: toOptionalNumber(row.per_km_rate_override),
             formatted_address: row.formatted_address || null,
             latitude: toOptionalCoordinate(row.latitude, -90, 90),
             longitude: toOptionalCoordinate(row.longitude, -180, 180),
@@ -136,12 +154,23 @@ class CallCenterPincodeService {
         const chargeType = normalizeChargeType(payload.charge_type);
         const averageOneWayDistanceKm = toOptionalNumber(payload.average_one_way_distance_km);
         const averageAdditionalCost = toOptionalNumber(payload.average_additional_cost);
-        const centerIds = parseCenterIds(payload.center_ids);
+        const centerMappings = parseCenterMappings(payload);
+        const centerIds = centerMappings.map((mapping) => mapping.centerId);
+        const suppliedMappings = Array.isArray(payload.center_mappings) ? payload.center_mappings : [];
 
         if (!pincode) throw Object.assign(new Error('A valid six-digit pincode is required'), { statusCode: 400 });
         if (!city) throw Object.assign(new Error('City is required'), { statusCode: 400 });
         if (!chargeType) throw Object.assign(new Error('Charge Type must be Free or Paid'), { statusCode: 400 });
         if (requireCenters && !centerIds.length) throw Object.assign(new Error('Select at least one diagnostic center'), { statusCode: 400 });
+        if (suppliedMappings.length && centerMappings.length !== suppliedMappings.length) {
+            throw Object.assign(new Error('A diagnostic center may be selected only once for a pincode'), { statusCode: 400 });
+        }
+        suppliedMappings.forEach((mapping) => {
+            const rawRate = mapping?.per_km_rate_override;
+            if (rawRate !== '' && rawRate !== null && rawRate !== undefined && toOptionalNumber(rawRate) === null) {
+                throw Object.assign(new Error('Pincode per-km rate must be a non-negative number'), { statusCode: 400 });
+            }
+        });
         return {
             pincode,
             city,
@@ -152,6 +181,7 @@ class CallCenterPincodeService {
             latitude: toOptionalCoordinate(payload.latitude, -90, 90),
             longitude: toOptionalCoordinate(payload.longitude, -180, 180),
             centerIds,
+            centerMappings,
         };
     }
 
@@ -314,7 +344,7 @@ class CallCenterPincodeService {
         sheet.columns = [
             { header: 'City', width: 24 }, { header: 'Pincode', width: 15 },
             { header: 'Center Name', width: 36 }, { header: 'Center Address', width: 52 },
-            { header: 'Pricing Type', width: 16 }, { header: 'DC Per KM Rate', width: 18 },
+            { header: 'Pricing Type', width: 16 }, { header: 'DC Per KM Rate', width: 18 }, { header: 'Pincode Per KM Override', width: 27 },
             { header: 'Approx One Way KM', width: 22 },
         ];
         sheet.getRow(1).font = { bold: true };
@@ -324,7 +354,7 @@ class CallCenterPincodeService {
         const centers = await this.getCenters();
         const mappings = await db.query(
             `SELECT p.city, p.pincode, dc.center_name, dc.address AS center_address,
-                    dc.extra_charge_per_km, p.charge_type, p.average_one_way_distance_km,
+                    dc.extra_charge_per_km, p.per_km_rate_override, p.charge_type, p.average_one_way_distance_km,
                     p.average_additional_cost
              FROM call_center_pincode_pricing p
              LEFT JOIN diagnostic_centers dc ON dc.id = p.center_id AND dc.is_deleted = 0
@@ -334,7 +364,7 @@ class CallCenterPincodeService {
         if (mappings.length) {
             mappings.forEach((mapping) => sheet.addRow([
                 mapping.city || '', mapping.pincode || '', mapping.center_name || '', mapping.center_address || '',
-                mapping.charge_type || 'free', mapping.extra_charge_per_km ?? 0,
+                mapping.charge_type || 'free', mapping.extra_charge_per_km ?? 0, mapping.per_km_rate_override ?? '',
                 mapping.average_one_way_distance_km ?? '',
             ]));
         } else {
@@ -342,9 +372,9 @@ class CallCenterPincodeService {
             const firstAddress = centers[0]?.address || '';
             const secondCenter = centers[1]?.center_name || firstCenter;
             const secondAddress = centers[1]?.address || firstAddress;
-            sheet.addRow(['Pune', '411028', firstCenter, firstAddress, 'free', '0', '5.50']);
-            sheet.addRow(['Pune', '411001', firstCenter, firstAddress, 'paid', '25', '12.00']);
-            sheet.addRow(['Pune', '411001', secondCenter, secondAddress, 'paid', '25', '12.00']);
+            sheet.addRow(['Pune', '411028', firstCenter, firstAddress, 'free', '0', '0', '5.50']);
+            sheet.addRow(['Pune', '411001', firstCenter, firstAddress, 'paid', '25', '30', '12.00']);
+            sheet.addRow(['Pune', '411001', secondCenter, secondAddress, 'paid', '25', '', '12.00']);
         }
         const centersSheet = workbook.addWorksheet('Centers');
         centersSheet.getColumn(1).values = ['Center Name', ...centers.map((center) => center.center_name)];
@@ -368,7 +398,12 @@ class CallCenterPincodeService {
     async importExcel(req, res) {
         if (!req.file?.buffer) throw Object.assign(new Error('Upload an Excel file using the excelFile field'), { statusCode: 400 });
         const workbook = new ExcelJS.Workbook();
-        await workbook.xlsx.load(req.file.buffer);
+        try {
+            await workbook.xlsx.load(req.file.buffer);
+        } catch (error) {
+            logger.warn('Rejected unreadable call center pincode workbook', { userId: req.user?.id, error: error.message });
+            throw Object.assign(new Error('The uploaded file is not a readable Excel workbook'), { statusCode: 400 });
+        }
         const sheet = workbook.worksheets[0];
         if (!sheet) throw Object.assign(new Error('The workbook does not contain a worksheet'), { statusCode: 400 });
         const headers = new Map();
@@ -404,6 +439,7 @@ class CallCenterPincodeService {
                             average_one_way_distance_km: headers.has('approx one way km') ? read('approx one way km') : null,
                             average_additional_cost: headers.has('final additional cost') ? read('final additional cost') : null,
                             center_ids: [],
+                            center_mappings: [],
                         },
                     });
                 }
@@ -415,6 +451,10 @@ class CallCenterPincodeService {
                 if (!samePincodeDetails) throw new Error('All rows for the same pincode must use the same city, pricing type, and distance');
                 if (mapping.payload.center_ids.includes(centerId)) throw new Error('Duplicate pincode and diagnostic center row');
                 mapping.payload.center_ids.push(centerId);
+                mapping.payload.center_mappings.push({
+                    center_id: centerId,
+                    per_km_rate_override: headers.has('pincode per km override') ? read('pincode per km override') : null,
+                });
             } catch (error) {
                 errors.push({ row: rowNumber, error: error.message });
             }
@@ -431,7 +471,7 @@ class CallCenterPincodeService {
                 const input = this.validatePayload(row.payload);
                 const [existing] = await connection.query(
                     `SELECT id, city, charge_type, average_one_way_distance_km,
-                            average_additional_cost, center_id, latitude, longitude
+                            average_additional_cost, per_km_rate_override, center_id, latitude, longitude
                      FROM call_center_pincode_pricing
                      WHERE pincode = ? AND is_deleted = 0
                      ORDER BY id ASC FOR UPDATE`,
@@ -440,11 +480,13 @@ class CallCenterPincodeService {
                 if (existing.length) {
                     const currentCenterIds = existing.map((item) => Number(item.center_id)).sort((a, b) => a - b);
                     const incomingCenterIds = [...input.centerIds].sort((a, b) => a - b);
+                    const incomingOverrides = new Map(input.centerMappings.map((mapping) => [mapping.centerId, mapping.perKmRateOverride ?? 0]));
                     const sameMapping = existing.length === incomingCenterIds.length
                         && currentCenterIds.every((centerId, index) => centerId === incomingCenterIds[index])
                         && normalizeText(existing[0].city) === normalizeText(input.city)
                         && normalizeChargeType(existing[0].charge_type) === normalizeChargeType(input.charge_type)
-                        && Number(existing[0].average_one_way_distance_km ?? 0) === Number(input.averageOneWayDistanceKm ?? 0);
+                        && Number(existing[0].average_one_way_distance_km ?? 0) === Number(input.averageOneWayDistanceKm ?? 0)
+                        && existing.every((item) => Number(item.per_km_rate_override ?? 0) === Number(incomingOverrides.get(Number(item.center_id)) ?? 0));
                     if (sameMapping) continue;
 
                     // The spreadsheet does not carry coordinates, so retain a

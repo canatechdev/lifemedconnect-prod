@@ -551,6 +551,80 @@ async function getDecoratedTechnicians(pincode, appointmentDate, availabilityEnd
     ));
 }
 
+function isActionableAppointment(row) {
+    const status = String(row.status || '').toLowerCase();
+    const medicalStatus = String(row.medical_status || '').toLowerCase();
+    return !['pushed_back', 'cancelled', 'canceled', 'completed'].includes(status)
+        && !['pushed_back', 'cancelled', 'canceled', 'completed', 'medical_completed'].includes(medicalStatus);
+}
+
+// This is a pincode-level planning snapshot, not technician capacity. The first
+// two selected days use the confirmed date when present; later days stay tied to
+// the original appointment date so future appointment planning remains stable.
+async function getPincodeAppointmentLoad(pincode, startDate, dates) {
+    const normalizedPincode = normalizePincode(pincode);
+    if (!normalizedPincode || !dates.length) return [];
+    const tomorrow = dates[1] || dates[0];
+    const laterStart = dates[2] || addDays(tomorrow, 1);
+    const endDate = dates[dates.length - 1];
+    const rows = await db.query(`
+        SELECT a.id, a.case_number, a.application_number, a.customer_first_name,
+               a.customer_last_name, a.gender, a.medical_type, a.status, a.medical_status,
+               a.appointment_date, a.appointment_time, a.confirmed_date, a.confirmed_time,
+               CASE
+                   WHEN DATE(COALESCE(a.confirmed_date, a.appointment_date)) BETWEEN ? AND ?
+                       THEN DATE_FORMAT(COALESCE(a.confirmed_date, a.appointment_date), '%Y-%m-%d')
+                   ELSE DATE_FORMAT(a.appointment_date, '%Y-%m-%d')
+               END AS planning_date,
+               CASE
+                   WHEN DATE(COALESCE(a.confirmed_date, a.appointment_date)) BETWEEN ? AND ?
+                       THEN COALESCE(a.confirmed_time, a.appointment_time)
+                   ELSE a.appointment_time
+               END AS planning_time
+        FROM appointments a
+        WHERE a.is_deleted = 0
+          AND a.pincode = ?
+          AND (
+              DATE(COALESCE(a.confirmed_date, a.appointment_date)) BETWEEN ? AND ?
+              OR DATE(a.appointment_date) BETWEEN ? AND ?
+          )
+        ORDER BY planning_date ASC, planning_time ASC, a.id ASC
+    `, [startDate, tomorrow, startDate, tomorrow, normalizedPincode, startDate, tomorrow, laterStart, endDate]);
+
+    const byDate = new Map(dates.map((date) => [date, []]));
+    rows.forEach((row) => {
+        if (byDate.has(row.planning_date)) byDate.get(row.planning_date).push({
+            id: Number(row.id),
+            case_number: row.case_number,
+            application_number: row.application_number,
+            customer_name: [row.customer_first_name, row.customer_last_name].filter(Boolean).join(' ') || '-',
+            gender: row.gender || 'Other',
+            medical_type: row.medical_type || null,
+            status: row.status || null,
+            medical_status: row.medical_status || null,
+            time: row.planning_time || null,
+            actionable: isActionableAppointment(row),
+        });
+    });
+    return dates.map((date) => {
+        const appointments = byDate.get(date) || [];
+        const counts = { male: 0, female: 0, other: 0, fasting: 0, non_fasting: 0, unspecified: 0 };
+        appointments.forEach((appointment) => {
+            counts[normalizeGender(appointment.gender)] += 1;
+            if (appointment.medical_type === 'fasting') counts.fasting += 1;
+            else if (appointment.medical_type === 'non_fasting') counts.non_fasting += 1;
+            else counts.unspecified += 1;
+        });
+        return {
+            date,
+            total: appointments.length,
+            actionable_total: appointments.filter((appointment) => appointment.actionable).length,
+            counts,
+            appointments,
+        };
+    });
+}
+
 function rankCenters(centers) {
     return centers
         .sort((a, b) => (
@@ -569,9 +643,10 @@ async function searchConfiguredPincode(input, pricing) {
     if (appointmentDate < today) throw operationalError('Availability can only be planned from today onwards.', 400);
     const availabilityDates = buildDateRange(appointmentDate, AVAILABILITY_LOOKAHEAD_DAYS);
     const availabilityEndDate = availabilityDates[availabilityDates.length - 1];
-    const [mappedCenters, decoratedTechnicians] = await Promise.all([
+    const [mappedCenters, decoratedTechnicians, appointmentLoad] = await Promise.all([
         getEligibleCenters(pricing.center_ids),
         getDecoratedTechnicians(pricing.pincode, appointmentDate, availabilityEndDate, availabilityDates, input.gender),
+        getPincodeAppointmentLoad(pricing.pincode, appointmentDate, availabilityDates),
     ]);
     const pricingByCenter = new Map(
         (pricing.center_pricing || []).map((item) => [Number(item.center_id), item]),
@@ -592,7 +667,7 @@ async function searchConfiguredPincode(input, pricing) {
         const oneWayDistance = centerPricing.average_one_way_distance_km;
         const roundTripDistance = oneWayDistance === null ? null : Number((oneWayDistance * 2).toFixed(2));
         const isFree = centerPricing.charge_type === 'free';
-        const perKmRate = round(Math.max(0, toNumber(center.extra_charge_per_km)), 2);
+        const perKmRate = round(Math.max(0, toNumber(centerPricing.per_km_rate_override ?? center.extra_charge_per_km)), 2);
         return {
         id: Number(center.id),
         center_name: center.center_name,
@@ -642,6 +717,7 @@ async function searchConfiguredPincode(input, pricing) {
         pincode_pricing: pricing,
         pincode_configured: true,
         can_save_pincode: false,
+        appointment_load: appointmentLoad,
         warning: centers.length
             ? null
             : 'This pincode is configured, but no linked diagnostic center is currently available.',
@@ -685,13 +761,10 @@ async function searchLivePlanner(input) {
         ? `${mappedCenters.length - routableCenters.length} center(s) were omitted because Google Routes returned no drivable route.`
         : null;
 
-    const decoratedTechnicians = await getDecoratedTechnicians(
-        location.pincode,
-        appointmentDate,
-        availabilityEndDate,
-        availabilityDates,
-        input.gender,
-    );
+    const [decoratedTechnicians, appointmentLoad] = await Promise.all([
+        getDecoratedTechnicians(location.pincode, appointmentDate, availabilityEndDate, availabilityDates, input.gender),
+        getPincodeAppointmentLoad(location.pincode, appointmentDate, availabilityDates),
+    ]);
 
     const centers = routableCenters.map((center) => {
         const route = roadDistances.get(Number(center.id));
@@ -743,6 +816,7 @@ async function searchLivePlanner(input) {
         pincode_pricing: savedPincode,
         pincode_configured: Boolean(savedPincode),
         can_save_pincode: !savedPincode,
+        appointment_load: appointmentLoad,
         warning: routeWarning,
         centers: rankedCenters,
     };
@@ -763,6 +837,7 @@ async function searchPlanner(input) {
                 search: { availability_end_date: null, mode: 'saved_pincode' },
                 summary: { centers_evaluated: 0, available_technicians: 0, centers_within_radius: 0, unmapped_centers: 0 },
                 pincode_pricing: null,
+                appointment_load: [],
                 pincode_configured: false,
                 can_save_pincode: false,
                 warning: 'This pincode is not configured. Use Live Location Search to find and save it.',

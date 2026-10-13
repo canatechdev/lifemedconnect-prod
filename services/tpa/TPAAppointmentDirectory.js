@@ -98,7 +98,7 @@ class TPAAppointmentDirectory {
                     a.visit_type,
                     a.appointment_date, a.appointment_time,
                     a.confirmed_date, a.confirmed_time,
-                    a.status, a.medical_status
+                    a.status, a.medical_status, a.medical_type
                  FROM appointments a
                  WHERE ${where}
                  ORDER BY a.appointment_date DESC, a.id DESC
