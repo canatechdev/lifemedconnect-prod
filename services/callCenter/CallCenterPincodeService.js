@@ -322,11 +322,13 @@ class CallCenterPincodeService {
                 [pricingId],
             );
             if (!current.length) throw Object.assign(new Error('Pincode mapping was not found'), { statusCode: 404 });
+            // A pincode can serve many diagnostic centers. Deleting one mapping
+            // must remove only the selected center row, not the whole pincode.
             const [result] = await connection.query(
                 `UPDATE call_center_pincode_pricing
                  SET is_deleted = 1, updated_by = ?, updated_at = NOW()
-                 WHERE pincode = ? AND is_deleted = 0`,
-                [userId || null, current[0].pincode],
+                 WHERE id = ? AND is_deleted = 0`,
+                [userId || null, pricingId],
             );
             if (!result.affectedRows) throw Object.assign(new Error('Pincode mapping was not found'), { statusCode: 404 });
             await connection.commit();

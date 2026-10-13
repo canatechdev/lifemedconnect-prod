@@ -69,6 +69,12 @@ router.get('/pincodes/centers', verifyToken, requirePermission('call_center.mana
     return ApiResponse.success(res, centers, 'Diagnostic centers retrieved successfully');
 }));
 
+router.get('/pincodes/by-pincode/:pincode', verifyToken, requirePermission('call_center.manage'), asyncHandler(async (req, res) => {
+    const data = await pincodeService.getActiveByPincode(req.params.pincode);
+    if (!data) return ApiResponse.notFound(res, 'Pincode mapping was not found');
+    return ApiResponse.success(res, data, 'Call Center pincode mapping retrieved successfully');
+}));
+
 router.get('/pincodes/template', verifyToken, requirePermission('call_center.manage'), asyncHandler((req, res) => pincodeService.downloadTemplate(req, res)));
 
 router.post('/pincodes/import', verifyToken, requirePermission('call_center.manage'), uploadLimiter, excelUpload.single('excelFile'), asyncHandler((req, res) => pincodeService.importExcel(req, res)));
