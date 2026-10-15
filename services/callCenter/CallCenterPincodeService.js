@@ -40,9 +40,16 @@ function parseCenterMappings(payload) {
     const mappings = supplied.length
         ? supplied.map((item) => ({
             centerId: Number(item?.center_id),
+            chargeType: normalizeChargeType(item?.charge_type),
             perKmRateOverride: toOptionalNumber(item?.per_km_rate_override),
+            averageOneWayDistanceKm: toOptionalNumber(item?.average_one_way_distance_km),
         }))
-        : parseCenterIds(payload.center_ids).map((centerId) => ({ centerId, perKmRateOverride: null }));
+        : parseCenterIds(payload.center_ids).map((centerId) => ({
+            centerId,
+            chargeType: normalizeChargeType(payload.charge_type),
+            perKmRateOverride: null,
+            averageOneWayDistanceKm: toOptionalNumber(payload.average_one_way_distance_km),
+        }));
     const seen = new Set();
     return mappings.filter((item) => {
         if (!Number.isInteger(item.centerId) || item.centerId <= 0 || seen.has(item.centerId)) return false;
@@ -71,9 +78,9 @@ async function getCentersByIds(connection, centerIds) {
 async function insertPincodeRows(connection, input, userId) {
     if (!input.centerMappings.length) return;
     const values = input.centerMappings.map((mapping) => [
-        input.pincode, mapping.centerId, input.city, input.chargeType,
-        input.averageOneWayDistanceKm, input.averageAdditionalCost,
-        input.chargeType === 'free' ? 0 : mapping.perKmRateOverride,
+        input.pincode, mapping.centerId, input.city, mapping.chargeType || input.chargeType,
+        mapping.averageOneWayDistanceKm ?? input.averageOneWayDistanceKm, input.averageAdditionalCost,
+        (mapping.chargeType || input.chargeType) === 'free' ? 0 : mapping.perKmRateOverride,
         input.formattedAddress, input.latitude, input.longitude,
         userId || null, userId || null,
     ]);
@@ -169,6 +176,13 @@ class CallCenterPincodeService {
             const rawRate = mapping?.per_km_rate_override;
             if (rawRate !== '' && rawRate !== null && rawRate !== undefined && toOptionalNumber(rawRate) === null) {
                 throw Object.assign(new Error('Pincode per-km rate must be a non-negative number'), { statusCode: 400 });
+            }
+            const rawDistance = mapping?.average_one_way_distance_km;
+            if (rawDistance !== '' && rawDistance !== null && rawDistance !== undefined && toOptionalNumber(rawDistance) === null) {
+                throw Object.assign(new Error('Pincode distance must be a non-negative number'), { statusCode: 400 });
+            }
+            if (mapping?.charge_type !== undefined && mapping.charge_type !== null && !normalizeChargeType(mapping.charge_type)) {
+                throw Object.assign(new Error('Charge Type must be Free or Paid'), { statusCode: 400 });
             }
         });
         return {
@@ -446,16 +460,16 @@ class CallCenterPincodeService {
                     });
                 }
                 const mapping = mappings.get(pincode);
-                const samePincodeDetails =
-                    normalizeText(mapping.payload.city) === normalizeText(read('city'))
-                    && normalizeText(mapping.payload.charge_type).toLowerCase() === normalizeText(read('pricing type')).toLowerCase()
-                    && normalizeText(mapping.payload.average_one_way_distance_km) === normalizeText(headers.has('approx one way km') ? read('approx one way km') : '');
-                if (!samePincodeDetails) throw new Error('All rows for the same pincode must use the same city, pricing type, and distance');
+                if (normalizeText(mapping.payload.city) !== normalizeText(read('city'))) {
+                    throw new Error('All rows for the same pincode must use the same city');
+                }
                 if (mapping.payload.center_ids.includes(centerId)) throw new Error('Duplicate pincode and diagnostic center row');
                 mapping.payload.center_ids.push(centerId);
                 mapping.payload.center_mappings.push({
                     center_id: centerId,
+                    charge_type: read('pricing type'),
                     per_km_rate_override: headers.has('pincode per km override') ? read('pincode per km override') : null,
+                    average_one_way_distance_km: headers.has('approx one way km') ? read('approx one way km') : null,
                 });
             } catch (error) {
                 errors.push({ row: rowNumber, error: error.message });
@@ -482,13 +496,16 @@ class CallCenterPincodeService {
                 if (existing.length) {
                     const currentCenterIds = existing.map((item) => Number(item.center_id)).sort((a, b) => a - b);
                     const incomingCenterIds = [...input.centerIds].sort((a, b) => a - b);
-                    const incomingOverrides = new Map(input.centerMappings.map((mapping) => [mapping.centerId, mapping.perKmRateOverride ?? 0]));
+                    const incomingMappings = new Map(input.centerMappings.map((mapping) => [mapping.centerId, mapping]));
                     const sameMapping = existing.length === incomingCenterIds.length
                         && currentCenterIds.every((centerId, index) => centerId === incomingCenterIds[index])
                         && normalizeText(existing[0].city) === normalizeText(input.city)
-                        && normalizeChargeType(existing[0].charge_type) === normalizeChargeType(input.charge_type)
-                        && Number(existing[0].average_one_way_distance_km ?? 0) === Number(input.averageOneWayDistanceKm ?? 0)
-                        && existing.every((item) => Number(item.per_km_rate_override ?? 0) === Number(incomingOverrides.get(Number(item.center_id)) ?? 0));
+                        && existing.every((item) => {
+                            const incoming = incomingMappings.get(Number(item.center_id));
+                            return normalizeChargeType(item.charge_type) === normalizeChargeType(incoming?.chargeType ?? input.chargeType)
+                                && Number(item.average_one_way_distance_km ?? 0) === Number(incoming?.averageOneWayDistanceKm ?? input.averageOneWayDistanceKm ?? 0)
+                                && Number(item.per_km_rate_override ?? 0) === Number(incoming?.perKmRateOverride ?? 0);
+                        });
                     if (sameMapping) continue;
 
                     // The spreadsheet does not carry coordinates, so retain a

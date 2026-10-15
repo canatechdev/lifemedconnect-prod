@@ -298,38 +298,47 @@ async function getUnavailability(technicianIds, startDate, endDate, dates) {
 async function getDailyAssignments(technicianIds, startDate, endDate) {
     if (!technicianIds.length) return new Map();
     const placeholders = technicianIds.map(() => '?').join(',');
+    const today = getIndiaDate();
 
     const itemAssignments = await db.query(`
         SELECT DISTINCT at.assigned_technician_id AS technician_id, a.id AS appointment_id,
                a.case_number, a.application_number, a.customer_first_name,
-               a.customer_last_name, a.gender, a.appointment_time, a.visit_type,
-               DATE_FORMAT(a.appointment_date, '%Y-%m-%d') AS planning_date
+               a.customer_last_name, a.gender, COALESCE(a.confirmed_time, a.appointment_time) AS appointment_time, a.visit_type,
+               DATE_FORMAT(COALESCE(a.confirmed_date, a.appointment_date), '%Y-%m-%d') AS planning_date
         FROM appointment_tests at
         INNER JOIN appointments a ON a.id = at.appointment_id
         WHERE at.assigned_technician_id IN (${placeholders})
           AND LOWER(COALESCE(at.visit_subtype, '')) = 'home'
           AND a.is_deleted = 0 AND a.is_active = 1
-          AND DATE(a.appointment_date) BETWEEN ? AND ?
-          AND a.visit_type IN ('Home_Visit', 'Both')
-    `, [...technicianIds, startDate, endDate]);
+          -- Capacity uses the confirmed date when it exists; otherwise the appointment date.
+          -- Past dates and completed/pushed-back work must never consume a future planner slot.
+          AND DATE(COALESCE(a.confirmed_date, a.appointment_date)) BETWEEN ? AND ?
+          AND DATE(COALESCE(a.confirmed_date, a.appointment_date)) >= ?
+          AND a.visit_type = 'Home_Visit'
+          AND LOWER(COALESCE(a.status, '')) NOT IN ('pushed_back', 'cancelled', 'canceled', 'completed')
+          AND LOWER(COALESCE(a.medical_status, '')) NOT IN ('pushed_back', 'cancelled', 'canceled', 'completed', 'medical_completed')
+    `, [...technicianIds, startDate, endDate, today]);
 
     const legacyAssignments = await db.query(`
         SELECT a.assigned_technician_id AS technician_id, a.id AS appointment_id,
                a.case_number, a.application_number, a.customer_first_name,
-               a.customer_last_name, a.gender, a.appointment_time, a.visit_type,
-               DATE_FORMAT(a.appointment_date, '%Y-%m-%d') AS planning_date
+               a.customer_last_name, a.gender, COALESCE(a.confirmed_time, a.appointment_time) AS appointment_time, a.visit_type,
+               DATE_FORMAT(COALESCE(a.confirmed_date, a.appointment_date), '%Y-%m-%d') AS planning_date
         FROM appointments a
         WHERE a.assigned_technician_id IN (${placeholders})
           AND a.is_deleted = 0 AND a.is_active = 1
-          AND DATE(a.appointment_date) BETWEEN ? AND ?
-          AND a.visit_type IN ('Home_Visit', 'Both')
+          AND DATE(COALESCE(a.confirmed_date, a.appointment_date)) BETWEEN ? AND ?
+          AND DATE(COALESCE(a.confirmed_date, a.appointment_date)) >= ?
+          AND a.visit_type = 'Home_Visit'
+          AND LOWER(COALESCE(a.status, '')) NOT IN ('pushed_back', 'cancelled', 'canceled', 'completed')
+          AND LOWER(COALESCE(a.medical_status, '')) NOT IN ('pushed_back', 'cancelled', 'canceled', 'completed', 'medical_completed')
           AND NOT EXISTS (
               SELECT 1 FROM appointment_tests existing_assignment
               WHERE existing_assignment.appointment_id = a.id
                 AND existing_assignment.assigned_technician_id IS NOT NULL
                 AND LOWER(COALESCE(existing_assignment.visit_subtype, '')) = 'home'
           )
-    `, [...technicianIds, startDate, endDate]);
+    `, [...technicianIds, startDate, endDate, today]);
 
     const assignments = new Map();
     [...itemAssignments, ...legacyAssignments].forEach((row) => {
@@ -558,38 +567,53 @@ function isActionableAppointment(row) {
         && !['pushed_back', 'cancelled', 'canceled', 'completed', 'medical_completed'].includes(medicalStatus);
 }
 
-// This is a pincode-level planning snapshot, not technician capacity. The first
-// two selected days use the confirmed date when present; later days stay tied to
-// the original appointment date so future appointment planning remains stable.
+// This is a pincode-level planning snapshot, not technician capacity.
+// Only Home_Visit cases are relevant. Today and tomorrow use confirmed_date when
+// available (otherwise appointment_date); dates after tomorrow always use
+// appointment_date. Every displayed effective date is today or later.
 async function getPincodeAppointmentLoad(pincode, startDate, dates) {
     const normalizedPincode = normalizePincode(pincode);
     if (!normalizedPincode || !dates.length) return [];
-    const tomorrow = dates[1] || dates[0];
-    const laterStart = dates[2] || addDays(tomorrow, 1);
+    const today = getIndiaDate();
+    const tomorrow = addDays(today, 1);
+    const laterStart = addDays(today, 2);
     const endDate = dates[dates.length - 1];
     const rows = await db.query(`
         SELECT a.id, a.case_number, a.application_number, a.customer_first_name,
                a.customer_last_name, a.gender, a.medical_type, a.status, a.medical_status,
                a.appointment_date, a.appointment_time, a.confirmed_date, a.confirmed_time,
                CASE
-                   WHEN DATE(COALESCE(a.confirmed_date, a.appointment_date)) BETWEEN ? AND ?
-                       THEN DATE_FORMAT(COALESCE(a.confirmed_date, a.appointment_date), '%Y-%m-%d')
+                   WHEN DATE(a.confirmed_date) BETWEEN ? AND ?
+                    AND DATE(a.confirmed_date) BETWEEN ? AND ?
+                       THEN DATE_FORMAT(a.confirmed_date, '%Y-%m-%d')
                    ELSE DATE_FORMAT(a.appointment_date, '%Y-%m-%d')
                END AS planning_date,
                CASE
-                   WHEN DATE(COALESCE(a.confirmed_date, a.appointment_date)) BETWEEN ? AND ?
+                   WHEN DATE(a.confirmed_date) BETWEEN ? AND ?
+                    AND DATE(a.confirmed_date) BETWEEN ? AND ?
                        THEN COALESCE(a.confirmed_time, a.appointment_time)
                    ELSE a.appointment_time
                END AS planning_time
         FROM appointments a
         WHERE a.is_deleted = 0
           AND a.pincode = ?
+          AND a.visit_type = 'Home_Visit'
           AND (
-              DATE(COALESCE(a.confirmed_date, a.appointment_date)) BETWEEN ? AND ?
-              OR DATE(a.appointment_date) BETWEEN ? AND ?
+              -- Today/tomorrow: confirmation wins; appointment date is a fallback only when no confirmation exists.
+              (a.confirmed_date IS NOT NULL AND DATE(a.confirmed_date) BETWEEN ? AND ? AND DATE(a.confirmed_date) BETWEEN ? AND ?)
+              OR (a.confirmed_date IS NULL AND DATE(a.appointment_date) BETWEEN ? AND ? AND DATE(a.appointment_date) BETWEEN ? AND ?)
+              -- Day after tomorrow onwards: appointment date is the single source of truth.
+              OR (DATE(a.appointment_date) >= ? AND DATE(a.appointment_date) BETWEEN ? AND ?)
           )
         ORDER BY planning_date ASC, planning_time ASC, a.id ASC
-    `, [startDate, tomorrow, startDate, tomorrow, normalizedPincode, startDate, tomorrow, laterStart, endDate]);
+    `, [
+        today, tomorrow, startDate, endDate,
+        today, tomorrow, startDate, endDate,
+        normalizedPincode,
+        today, tomorrow, startDate, endDate,
+        today, tomorrow, startDate, endDate,
+        laterStart, startDate, endDate,
+    ]);
 
     const byDate = new Map(dates.map((date) => [date, []]));
     rows.forEach((row) => {

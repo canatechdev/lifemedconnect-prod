@@ -36,7 +36,9 @@ const pincodeMappingSchema = Joi.object({
     average_additional_cost: Joi.number().min(0).allow(null, '').optional(),
     center_mappings: Joi.array().items(Joi.object({
         center_id: Joi.number().integer().positive().required(),
+        charge_type: Joi.string().valid('free', 'paid', 'Free', 'Paid').optional(),
         per_km_rate_override: Joi.number().min(0).allow(null, '').optional(),
+        average_one_way_distance_km: Joi.number().min(0).allow(null, '').optional(),
     })).optional(),
     formatted_address: Joi.string().trim().max(2000).allow('', null).optional(),
     latitude: Joi.number().min(-90).max(90).allow(null).optional(),
