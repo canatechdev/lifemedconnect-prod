@@ -303,18 +303,18 @@ async function getDailyAssignments(technicianIds, startDate, endDate) {
     const itemAssignments = await db.query(`
         SELECT DISTINCT at.assigned_technician_id AS technician_id, a.id AS appointment_id,
                a.case_number, a.application_number, a.customer_first_name,
-               a.customer_last_name, a.gender, COALESCE(a.confirmed_time, a.appointment_time) AS appointment_time, a.visit_type,
+               a.customer_last_name, a.gender, COALESCE(a.confirmed_time, a.appointment_time) AS appointment_time, a.visit_type, at.visit_subtype,
                DATE_FORMAT(COALESCE(a.confirmed_date, a.appointment_date), '%Y-%m-%d') AS planning_date
         FROM appointment_tests at
         INNER JOIN appointments a ON a.id = at.appointment_id
         WHERE at.assigned_technician_id IN (${placeholders})
-          AND LOWER(COALESCE(at.visit_subtype, '')) = 'home'
+          AND LOWER(TRIM(COALESCE(at.visit_subtype, ''))) = 'home'
           AND a.is_deleted = 0 AND a.is_active = 1
           -- Capacity uses the confirmed date when it exists; otherwise the appointment date.
           -- Past dates and completed/pushed-back work must never consume a future planner slot.
           AND DATE(COALESCE(a.confirmed_date, a.appointment_date)) BETWEEN ? AND ?
           AND DATE(COALESCE(a.confirmed_date, a.appointment_date)) >= ?
-          AND a.visit_type = 'Home_Visit'
+          AND LOWER(TRIM(COALESCE(a.visit_type, ''))) = 'home_visit'
           AND LOWER(COALESCE(a.status, '')) NOT IN ('pushed_back', 'cancelled', 'canceled', 'completed')
           AND LOWER(COALESCE(a.medical_status, '')) NOT IN ('pushed_back', 'cancelled', 'canceled', 'completed', 'medical_completed')
     `, [...technicianIds, startDate, endDate, today]);
@@ -329,14 +329,14 @@ async function getDailyAssignments(technicianIds, startDate, endDate) {
           AND a.is_deleted = 0 AND a.is_active = 1
           AND DATE(COALESCE(a.confirmed_date, a.appointment_date)) BETWEEN ? AND ?
           AND DATE(COALESCE(a.confirmed_date, a.appointment_date)) >= ?
-          AND a.visit_type = 'Home_Visit'
+          AND LOWER(TRIM(COALESCE(a.visit_type, ''))) = 'home_visit'
           AND LOWER(COALESCE(a.status, '')) NOT IN ('pushed_back', 'cancelled', 'canceled', 'completed')
           AND LOWER(COALESCE(a.medical_status, '')) NOT IN ('pushed_back', 'cancelled', 'canceled', 'completed', 'medical_completed')
           AND NOT EXISTS (
               SELECT 1 FROM appointment_tests existing_assignment
               WHERE existing_assignment.appointment_id = a.id
                 AND existing_assignment.assigned_technician_id IS NOT NULL
-                AND LOWER(COALESCE(existing_assignment.visit_subtype, '')) = 'home'
+                AND LOWER(TRIM(COALESCE(existing_assignment.visit_subtype, ''))) = 'home'
           )
     `, [...technicianIds, startDate, endDate, today]);
 
