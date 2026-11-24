@@ -12,12 +12,18 @@ const db = require('../../lib/dbconnection');
 const logger = require('../../lib/logger');
 const { getLetterheadDataUrl, generatePdfBuffer, getStandardMargins } = require('../../lib/pdfUtils');
 const { sanitizeFolderName } = require('../../lib/fileUpload');
+// TEMP DIAGNOSTIC LOGS: remove this import and marked blocks after the observation window.
+const { diagnosticLog, diagnosticError, operationId } = require('../../lib/diagnosticLogger');
 
 class AppointmentTPAPDFService {
     /**
      * Generate TPA PDF for completed appointment
      */
     async generateTPAPDF(appointmentId) {
+        // TEMP DIAGNOSTIC LOGS: trace PDF stages without logging report/customer contents.
+        const diagnosticOperationId = operationId('tpa-pdf');
+        const startedAt = Date.now();
+        diagnosticLog('tpa.pdf.start', { diagnosticOperationId, appointmentId });
         try {
             const appointmentData = await this.fetchAppointmentData(appointmentId);
             if (!appointmentData) {
@@ -31,6 +37,17 @@ class AppointmentTPAPDFService {
             const baseUrl = process.env.BASE_URL || 'http://localhost:5050';
             const pdfUrl = `${baseUrl}/${savedPath}`;
 
+            diagnosticLog('tpa.pdf.complete', {
+                diagnosticOperationId,
+                appointmentId,
+                durationMs: Date.now() - startedAt,
+                pdfBytes: finalPdfBuffer.length,
+                reportCount: appointmentData.reports?.length || 0,
+                imageCount: appointmentData.customerImages?.length || 0,
+                documentCount: appointmentData.customerDocuments?.length || 0,
+                pdfPath: savedPath
+            });
+
             return {
                 success: true,
                 pdfPath: savedPath,
@@ -38,7 +55,13 @@ class AppointmentTPAPDFService {
                 message: 'TPA PDF generated successfully'
             };
         } catch (error) {
-            console.error('Error generating TPA PDF:', error);
+            diagnosticError('tpa.pdf.failed', {
+                diagnosticOperationId,
+                appointmentId,
+                durationMs: Date.now() - startedAt,
+                error: error.message
+            });
+            logger.error('Error generating TPA PDF', { appointmentId, error: error.message });
             throw error;
         }
     }
@@ -47,6 +70,7 @@ class AppointmentTPAPDFService {
      * Fetch all appointment related data
      */
     async fetchAppointmentData(appointmentId) {
+        const startedAt = Date.now();
         const appointments = await db.query(
             `SELECT a.*, 
                     c.client_name, c.client_code,
@@ -65,6 +89,7 @@ class AppointmentTPAPDFService {
         );
 
         if (!appointments || appointments.length === 0) {
+            diagnosticLog('tpa.pdf.data.not_found', { appointmentId, durationMs: Date.now() - startedAt });
             return null;
         }
 
@@ -103,13 +128,24 @@ class AppointmentTPAPDFService {
             };
         }
 
-        return {
+        const result = {
             ...appointment,
             customerImages,
             customerDocuments,
             reports,
             pathologyData
         };
+
+        diagnosticLog('tpa.pdf.data.complete', {
+            appointmentId,
+            durationMs: Date.now() - startedAt,
+            imageCount: customerImages.length,
+            documentCount: customerDocuments.length,
+            reportCount: reports.length,
+            hasPathologyData: Boolean(pathologyData)
+        });
+
+        return result;
     }
 
     /**
@@ -439,6 +475,7 @@ class AppointmentTPAPDFService {
      * Save PDF to file system
      */
     async savePDF(pdfBuffer, caseNumber) {
+        const startedAt = Date.now();
         // Organize by case_number subfolder
         const safeCaseFolder = sanitizeFolderName(caseNumber);
         const uploadsDir = safeCaseFolder
@@ -450,9 +487,15 @@ class AppointmentTPAPDFService {
         const filename = `TPA_${sanitizedCaseNumber}_${timestamp}.pdf`;
         const filepath = path.join(uploadsDir, filename);
         await fs.writeFile(filepath, pdfBuffer);
-        return safeCaseFolder
+        const savedPath = safeCaseFolder
             ? `uploads/appointment_tpa_pdfs/${safeCaseFolder}/${filename}`
             : `uploads/appointment_tpa_pdfs/${filename}`;
+        diagnosticLog('tpa.pdf.file_saved', {
+            durationMs: Date.now() - startedAt,
+            pdfBytes: pdfBuffer.length,
+            pdfPath: savedPath
+        });
+        return savedPath;
     }
 }
 
