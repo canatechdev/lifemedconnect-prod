@@ -6,8 +6,6 @@
 const db = require('../../lib/dbconnection');
 const { generateCustomCode } = require('../../lib/generateCode');
 const logger = require('../../lib/logger');
-// TEMP DIAGNOSTIC LOGS: remove this import and marked blocks after the observation window.
-const { diagnosticLog, diagnosticError, operationId } = require('../../lib/diagnosticLogger');
 
 /**
  * Helper function to build date filter conditions
@@ -551,13 +549,6 @@ async function cloneAppointment(sourceAppointmentId, userId = null) {
  * List appointments with pagination and search
  */
 async function listAppointments({ page = 1, limit = 0, search = '', sortBy = 'id', sortOrder = 'DESC', customerCategory = '', month = '', year = '', visitType = '', status = '', medicalStatus = '', qcStatus = '', userId = null, userRole = null, dateField = 'created_at', rangeType = '', fromDate = '', toDate = '', centerIds = [], listType = 'all' }) {
-    // TEMP DIAGNOSTIC LOGS: measure count and data query separately for slow-page investigation.
-    const diagnosticStartedAt = Date.now();
-    let diagnosticOperationId = null;
-    const getDiagnosticOperationId = () => {
-        if (!diagnosticOperationId) diagnosticOperationId = operationId('appointments-list');
-        return diagnosticOperationId;
-    };
     const searchColumns = ['case_number', 'application_number', 'customer_first_name', 'customer_last_name', 'customer_mobile', 'customer_email', 'home_center.center_name', 'other_center.center_name', 'clients.client_name', 'insurers.insurer_name'];
     const searchParams = [];
     const conditions = [];
@@ -693,30 +684,7 @@ async function listAppointments({ page = 1, limit = 0, search = '', sortBy = 'id
                     LEFT JOIN users center_tech_user ON center_tech.user_id = center_tech_user.id
                     LEFT JOIN users home_tech_user ON home_tech.user_id = home_tech_user.id
                     LEFT JOIN users tech_user ON tech.user_id = tech_user.id${whereClause}`;
-    const countStartedAt = Date.now();
-    let countRows;
-    try {
-        [countRows] = await db.pool.query(countSql, searchParams);
-        const countDurationMs = Date.now() - countStartedAt;
-        if (countDurationMs >= 500) {
-            diagnosticLog('appointments.list.count.slow', {
-                operationId: getDiagnosticOperationId(),
-                durationMs: countDurationMs,
-                total: countRows[0]?.total ?? 0,
-                page: Number(page),
-                limit: Number(limit),
-                hasSearch: Boolean(String(search || '').trim()),
-                listType
-            });
-        }
-    } catch (error) {
-        diagnosticError('appointments.list.count.failed', {
-            operationId: getDiagnosticOperationId(),
-            durationMs: Date.now() - countStartedAt,
-            error: error.message
-        });
-        throw error;
-    }
+    const [countRows] = await db.pool.query(countSql, searchParams);
     const total = countRows[0].total;
 
     const numericLimit = Number(limit);
@@ -777,41 +745,7 @@ async function listAppointments({ page = 1, limit = 0, search = '', sortBy = 'id
         dataParams.push(numericLimit, offset);
     }
 
-    const dataStartedAt = Date.now();
-    let rows;
-    try {
-        [rows] = await db.pool.query(sql, dataParams);
-        const dataDurationMs = Date.now() - dataStartedAt;
-        if (dataDurationMs >= 500) {
-            diagnosticLog('appointments.list.data.slow', {
-                operationId: getDiagnosticOperationId(),
-                durationMs: dataDurationMs,
-                returnedRows: rows.length,
-                page: numericPage,
-                limit: numericLimit,
-                offset: numericLimit > 0 ? (numericPage - 1) * numericLimit : 0
-            });
-        }
-    } catch (error) {
-        diagnosticError('appointments.list.data.failed', {
-            operationId: getDiagnosticOperationId(),
-            durationMs: Date.now() - dataStartedAt,
-            error: error.message
-        });
-        throw error;
-    }
-
-    const totalDurationMs = Date.now() - diagnosticStartedAt;
-    if (totalDurationMs >= 500) {
-        diagnosticLog('appointments.list.slow', {
-            operationId: getDiagnosticOperationId(),
-            durationMs: totalDurationMs,
-            total,
-            returnedRows: rows.length,
-            page: numericPage,
-            limit: numericLimit
-        });
-    }
+    const [rows] = await db.pool.query(sql, dataParams);
 
     return {
         data: rows,

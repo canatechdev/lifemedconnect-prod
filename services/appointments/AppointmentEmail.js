@@ -9,8 +9,6 @@ const emailService = require('../../lib/emailService');
 const AppointmentTPAPDF = require('./AppointmentComprehensivePDF');
 const { logTpaEmail } = require('../s_tap_email_log');
 const { triggerQCCompleted } = require('../../lib/tpaWebhookHelper');
-// TEMP DIAGNOSTIC LOGS: remove this import and marked blocks after the observation window.
-const { diagnosticLog, diagnosticError, operationId } = require('../../lib/diagnosticLogger');
 
 /**
  * Check if TPA email feature is enabled
@@ -58,10 +56,6 @@ class AppointmentEmailService {
      * @returns {Promise<Object>} Result with success status and message
      */
     async sendAppointmentEmailToClient(appointmentId, sentBy = null) {
-        // TEMP DIAGNOSTIC LOGS: trace data -> PDF -> SMTP -> DB-log stages without recipient addresses.
-        const diagnosticOperationId = operationId('tpa-email');
-        const startedAt = Date.now();
-        diagnosticLog('tpa.email.start', { diagnosticOperationId, appointmentId, sentBy });
         // Check if feature is enabled
         if (!isTpaEmailEnabled()) {
             logger.info('TPA email feature is disabled (TPA_EMAIL_ENABLED=false)');
@@ -100,13 +94,6 @@ class AppointmentEmailService {
             }
 
             const appointment = appointments[0];
-            diagnosticLog('tpa.email.data.complete', {
-                diagnosticOperationId,
-                appointmentId,
-                durationMs: Date.now() - startedAt,
-                clientId: appointment.client_id,
-                visitType: appointment.visit_type
-            });
 
             const amountEvidenceError = validateAmountEvidence(appointment);
             if (amountEvidenceError) {
@@ -154,14 +141,6 @@ class AppointmentEmailService {
                 };
             }
 
-            diagnosticLog('tpa.email.composed', {
-                diagnosticOperationId,
-                appointmentId,
-                recipientCount: recipients.length,
-                ccCount: ccList.length,
-                pdfPath: pdfResult.pdfPath
-            });
-
             // Log email details for tracking
             logger.info('Sending appointment completion email', {
                 appointmentId,
@@ -173,7 +152,6 @@ class AppointmentEmailService {
             });
 
             // Send email with PDF attachment and CC to diagnostic centers
-            const smtpStartedAt = Date.now();
             const emailResult = await emailService.sendAppointmentCompletionEmail(
                 recipients,
                 appointment,
@@ -182,12 +160,6 @@ class AppointmentEmailService {
             );
 
             if (!emailResult.success) {
-                diagnosticError('tpa.email.smtp.failed', {
-                    diagnosticOperationId,
-                    appointmentId,
-                    durationMs: Date.now() - smtpStartedAt,
-                    error: emailResult.message
-                });
                 return {
                     success: false,
                     message: emailResult.message || 'Failed to send email',
@@ -201,23 +173,11 @@ class AppointmentEmailService {
                 applicationNumber: appointment.application_number || `APT-${appointmentId}`,
                 caseNumber: appointment.case_number
             });
-            diagnosticLog('tpa.email.smtp.complete', {
-                diagnosticOperationId,
-                appointmentId,
-                durationMs: Date.now() - smtpStartedAt,
-                messageId: emailResult.messageId
-            });
 
             // Log TPA email with client relationship
             try {
                 await logTpaEmail(appointmentId, appointment.client_id, recipients, sentBy, 'sent');
-                diagnosticLog('tpa.email.db_log.complete', { diagnosticOperationId, appointmentId });
             } catch (logError) {
-                diagnosticError('tpa.email.db_log.failed', {
-                    diagnosticOperationId,
-                    appointmentId,
-                    error: logError.message
-                });
                 logger.error('Failed to log TPA email', {
                     appointmentId,
                     client_id: appointment.client_id,
@@ -282,12 +242,6 @@ class AppointmentEmailService {
                 }
             };
         } catch (error) {
-            diagnosticError('tpa.email.failed', {
-                diagnosticOperationId,
-                appointmentId,
-                durationMs: Date.now() - startedAt,
-                error: error.message
-            });
             logger.error('Error sending appointment email', {
                 appointmentId,
                 error: error.message

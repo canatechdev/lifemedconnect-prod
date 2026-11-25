@@ -26,8 +26,6 @@ const {
 const fs = require('fs');
 const path = require('path');
 const db = require('../lib/dbconnection');
-// TEMP DIAGNOSTIC LOGS: remove this import and marked blocks after the observation window.
-const { diagnosticLog, diagnosticError } = require('../lib/diagnosticLogger');
 
 //  NEW: Import security middleware
 const { uploadLimiter } = require('../middleware/security');
@@ -2201,9 +2199,6 @@ router.get('/appointments/:id/tpa-pdf',
     requireAnyPermission(['appointments.view', 'appointments.lifecycle']),
     asyncHandler(async (req, res) => {
         const appointmentId = parseInt(req.params.id);
-        const downloadStartedAt = Date.now();
-        // TEMP DIAGNOSTIC LOGS: capture PDF generation and browser download handoff.
-        diagnosticLog('tpa.pdf.download.start', { appointmentId });
         const result = await service.generateTPAPDF(appointmentId);
         
         if (!result || !result.pdfPath) {
@@ -2218,16 +2213,8 @@ router.get('/appointments/:id/tpa-pdf',
         const absolutePath = path.resolve(result.pdfPath);
         
         if (!fs.existsSync(absolutePath)) {
-            diagnosticError('tpa.pdf.download.file_missing', { appointmentId, pdfPath: result.pdfPath });
             return ApiResponse.notFound(res, 'TPA PDF file not found');
         }
-
-        diagnosticLog('tpa.pdf.download.ready', {
-            appointmentId,
-            durationMs: Date.now() - downloadStartedAt,
-            pdfBytes: fs.statSync(absolutePath).size,
-            pdfPath: result.pdfPath
-        });
 
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `inline; filename="TPA_${appointmentId}.pdf"`);
