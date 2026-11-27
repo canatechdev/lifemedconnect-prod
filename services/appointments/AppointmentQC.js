@@ -63,14 +63,28 @@ async function listQCPendingAppointments({ page = 1, limit = 10, search = '', so
     const { conditions: advancedConditions, params: advancedParams } = applyAdvancedFilters(conditions, searchParams, advancedFilters, 'a');
 
     const whereClause = `WHERE ${advancedConditions.join(' AND ')}`;
+    const centerJoins = `
+        LEFT JOIN diagnostic_centers dc ON a.center_id = dc.id
+        LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id
+    `;
+    const searchJoins = search ? centerJoins : '';
 
     const countSql = `
         SELECT COUNT(*) as total
-        FROM appointments a
-        LEFT JOIN diagnostic_centers dc ON a.center_id = dc.id
-        LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id
+        FROM appointments a ${searchJoins}
         ${whereClause}
     `;
+
+    const numericLimit = Number(limit);
+    const numericPage = Number(page);
+    const offset = numericLimit > 0 ? (numericPage - 1) * numericLimit : 0;
+    const orderBy = `ORDER BY a.${validSortBy} ${validSortOrder}` +
+        (validSortBy === 'id' ? '' : `, a.id ${validSortOrder}`);
+    // Resolve the page before aggregating tests and email records.
+    const pageSource = numericLimit > 0 ? `(
+        SELECT a.id FROM appointments a ${searchJoins}
+        ${whereClause} ${orderBy} LIMIT ? OFFSET ?
+    ) page_ids STRAIGHT_JOIN appointments a ON a.id = page_ids.id` : 'appointments a';
 
     const dataSql = `
         SELECT 
@@ -116,26 +130,16 @@ async function listQCPendingAppointments({ page = 1, limit = 10, search = '', so
                 WHERE tel.appointment_id = a.id AND tel.is_deleted = 0
                 ORDER BY tel.sent_at DESC
             ) as tpa_emails
-        FROM appointments a
-        LEFT JOIN diagnostic_centers dc ON a.center_id = dc.id
-        LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id
-        ${whereClause}
-        ORDER BY a.${validSortBy} ${validSortOrder}
+        FROM ${pageSource} ${centerJoins}
+        ${numericLimit > 0 ? '' : whereClause}
+        ${orderBy}
     `;
 
     const countRows = await db.query(countSql, advancedParams);
     const total = countRows[0]?.total || 0;
 
-    const numericLimit = Number(limit);
-    const numericPage = Number(page);
-    const offset = numericLimit > 0 ? (numericPage - 1) * numericLimit : 0;
-
-    let finalSql = dataSql;
-    if (numericLimit > 0) {
-        finalSql += ` LIMIT ${numericLimit} OFFSET ${offset}`;
-    }
-
-    let rows = await db.query(finalSql, advancedParams);
+    // Match the main list: mysql2's prepared execute can bind LIMIT/OFFSET as doubles.
+    let [rows] = await db.pool.query(dataSql, numericLimit > 0 ? [...advancedParams, numericLimit, offset] : advancedParams);
 
     // Parse tests and tpa_emails data
     rows = rows.map(row => {

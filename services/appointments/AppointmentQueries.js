@@ -531,22 +531,31 @@ async function listAllConfirmedAppointments({ page = 1, limit = 0, search = '', 
     
     const whereClause = `WHERE ${advancedConditions.join(' AND ')}`;
 
-    const countSql = `SELECT COUNT(*) as total FROM appointments a LEFT JOIN diagnostic_centers c ON a.center_id = c.id LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id ${whereClause}`;
+    const centerJoins = `
+        LEFT JOIN diagnostic_centers c ON a.center_id = c.id
+        LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id
+    `;
+    const searchJoins = search ? centerJoins : '';
+    const countSql = `SELECT COUNT(*) as total FROM appointments a ${searchJoins} ${whereClause}`;
     const countRows = await db.query(countSql, advancedParams);
     const total = countRows[0]?.total || 0;
-
-    const dataSql = `SELECT a.*, c.center_name as home_center_name, dc2.center_name as other_center_name, cl.client_name FROM appointments a LEFT JOIN diagnostic_centers c ON a.center_id = c.id LEFT JOIN diagnostic_centers dc2 ON a.other_center_id = dc2.id LEFT JOIN clients cl ON a.client_id = cl.id ${whereClause} ORDER BY a.${validSortBy} ${validSortOrder}`;
 
     const numericLimit = Number(limit);
     const numericPage = Number(page);
     const offset = numericLimit > 0 ? (numericPage - 1) * numericLimit : 0;
-
-    let rows;
-    if (numericLimit > 0) {
-        rows = await db.query(`${dataSql} LIMIT ${numericLimit} OFFSET ${offset}`, advancedParams);
-    } else {
-        rows = await db.query(dataSql, advancedParams);
-    }
+    const orderBy = `ORDER BY a.${validSortBy} ${validSortOrder}, a.id ${validSortOrder}`;
+    const pageSource = numericLimit > 0 ? `(
+        SELECT a.id FROM appointments a ${searchJoins}
+        ${whereClause} ${orderBy} LIMIT ? OFFSET ?
+    ) page_ids STRAIGHT_JOIN appointments a ON a.id = page_ids.id` : 'appointments a';
+    const dataSql = `
+        SELECT a.*, c.center_name as home_center_name, dc2.center_name as other_center_name, cl.client_name
+        FROM ${pageSource} ${centerJoins}
+        LEFT JOIN clients cl ON a.client_id = cl.id
+        ${numericLimit > 0 ? '' : whereClause}
+        ${orderBy}
+    `;
+    const [rows] = await db.pool.query(dataSql, numericLimit > 0 ? [...advancedParams, numericLimit, offset] : advancedParams);
 
     return {
         data: rows,

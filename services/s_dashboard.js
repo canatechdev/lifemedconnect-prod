@@ -181,157 +181,54 @@ class DashboardService {
       ? { conditions: getStatusConditions('qc_pending', 'appointments'), params: [] }
       : getAppointmentListDefinition('report-upload', 'appointments');
 
-    const monthFilters = {
-      current: 'YEAR(appointment_date) = YEAR(CURDATE()) AND MONTH(appointment_date) = MONTH(CURDATE())',
-      previous: 'YEAR(appointment_date) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(appointment_date) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH))'
-    };
-
-    const buckets = [
-      { key: 'totalAppointments', condition: '1=1', dateExpr: 'appointment_date' },
-      {
-        key: 'confirmedScheduled',
-        condition: confirmedScheduledDefinition.conditions.join(' AND '),
-        params: confirmedScheduledDefinition.params,
-        dateExpr: 'COALESCE(home_confirmed_at, center_confirmed_at, confirmed_date, appointment_date)'
-      },
-      {
-        key: 'qcPending',
-        condition: qcPendingDefinition.conditions.join(' AND '),
-        params: qcPendingDefinition.params,
-        dateExpr: 'appointment_date'
-      },
-      {
-        key: 'completed',
-        condition: "status = 'completed'",
-        dateExpr: 'appointment_date'
-      },
-      {
-        key: 'today',
-        condition: '1=1',
-        dateExpr: 'appointment_date'
-      },
-      {
-        key: 'todayMedicalDone',
-        condition: `(
-          medical_status IN ('completed', 'complete')
+    const dailyCounts = `
+      SELECT appointment_date,
+        EXTRACT(YEAR_MONTH FROM COALESCE(home_confirmed_at, center_confirmed_at, confirmed_date, appointment_date)) AS confirmed_month,
+        COUNT(*) AS appointment_count,
+        COUNT(CASE WHEN ${confirmedScheduledDefinition.conditions.join(' AND ')} THEN 1 END) AS confirmed_count,
+        COUNT(CASE WHEN ${qcPendingDefinition.conditions.join(' AND ')} THEN 1 END) AS qc_count,
+        COUNT(CASE WHEN status = 'completed' THEN 1 END) AS completed_count,
+        COUNT(CASE WHEN medical_status IN ('completed', 'complete')
           OR center_medical_status IN ('completed', 'complete')
-          OR home_medical_status IN ('completed', 'complete')
-        )`,
-        dateExpr: 'appointment_date'
-      },
-      {
-        key: 'tomorrow',
-        condition: '1=1',
-        dateExpr: 'appointment_date'
-      },
-      {
-        key: 'upcoming',
-        condition: '1=1',
-        dateExpr: 'appointment_date'
-      },
+          OR home_medical_status IN ('completed', 'complete') THEN 1 END) AS medical_done_count
+      FROM appointments
+      ${baseWhere}
+      GROUP BY appointment_date, confirmed_month
+    `;
+
+    // Use the existing local-day rule for day buckets and the original dates for month comparisons.
+    const localDate = "DATE(CONVERT_TZ(appointment_date, '+00:00', @@global.time_zone))";
+    const buckets = [
+      { key: 'totalAppointments', count: 'appointment_count' },
+      { key: 'confirmedScheduled', count: 'confirmed_count', month: 'confirmed_month' },
+      { key: 'qcPending', count: 'qc_count' },
+      { key: 'completed', count: 'completed_count' },
+      { key: 'today', count: 'appointment_count', condition: `${localDate} = CURDATE()` },
+      { key: 'todayMedicalDone', count: 'medical_done_count', condition: `${localDate} = CURDATE()` },
+      { key: 'tomorrow', count: 'appointment_count', condition: `${localDate} = DATE_ADD(CURDATE(), INTERVAL 1 DAY)` },
+      { key: 'upcoming', count: 'appointment_count', condition: `${localDate} > CURDATE()` }
     ];
 
+    // Group first so date comparisons run over subtotals, not every appointment for each card.
+    const projection = buckets.flatMap(({ key, count, month = 'EXTRACT(YEAR_MONTH FROM appointment_date)', condition = '1=1' }) => [
+      `SUM(CASE WHEN ${condition} THEN ${count} ELSE 0 END) AS ${key}_total`,
+      `SUM(CASE WHEN (${condition}) AND ${month} = EXTRACT(YEAR_MONTH FROM CURDATE()) THEN ${count} ELSE 0 END) AS ${key}_current`,
+      `SUM(CASE WHEN (${condition}) AND ${month} = EXTRACT(YEAR_MONTH FROM DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN ${count} ELSE 0 END) AS ${key}_previous`
+    ]);
+    const [row] = await db.query(
+      `SELECT ${projection.join(',\n')} FROM (${dailyCounts}) daily_counts`,
+      [...confirmedScheduledDefinition.params, ...qcPendingDefinition.params, ...params]
+    );
+
     const results = {};
-
-    for (const bucket of buckets) {
-      const dateExpr = bucket.dateExpr || 'appointment_date';
-      let sql, total, currentMonth, previousMonth;
-      
-      // Special handling for date-based buckets - use same logic as appointments list
-      if (['today', 'todayMedicalDone', 'tomorrow', 'upcoming'].includes(bucket.key)) {
-        switch (bucket.key) {
-          case 'today':
-          case 'todayMedicalDone':
-            // For appointment_date, use timezone-aware logic like appointments list
-            if (dateExpr === 'appointment_date') {
-              sql = `
-                SELECT
-                  COUNT(*) AS totalCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
-                FROM appointments
-                ${baseWhere} AND ${bucket.condition} AND DATE(CONVERT_TZ(${dateExpr}, '+00:00', @@global.time_zone)) = DATE(CURDATE())
-              `;
-            } else {
-              sql = `
-                SELECT
-                  COUNT(*) AS totalCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
-                FROM appointments
-                ${baseWhere} AND ${bucket.condition} AND DATE(${dateExpr}) = CURDATE()
-              `;
-            }
-            break;
-          case 'tomorrow':
-            if (dateExpr === 'appointment_date') {
-              sql = `
-                SELECT
-                  COUNT(*) AS totalCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
-                FROM appointments
-                ${baseWhere} AND ${bucket.condition} AND DATE(CONVERT_TZ(${dateExpr}, '+00:00', @@global.time_zone)) = DATE_ADD(CURDATE(), INTERVAL 1 DAY)
-              `;
-            } else {
-              sql = `
-                SELECT
-                  COUNT(*) AS totalCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
-                FROM appointments
-                ${baseWhere} AND ${bucket.condition} AND DATE(${dateExpr}) = DATE_ADD(CURDATE(), INTERVAL 1 DAY)
-              `;
-            }
-            break;
-          case 'upcoming':
-            if (dateExpr === 'appointment_date') {
-              sql = `
-                SELECT
-                  COUNT(*) AS totalCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
-                FROM appointments
-                ${baseWhere} AND ${bucket.condition} AND DATE(CONVERT_TZ(${dateExpr}, '+00:00', @@global.time_zone)) > DATE(CURDATE())
-              `;
-            } else {
-              sql = `
-                SELECT
-                  COUNT(*) AS totalCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
-                  SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
-                FROM appointments
-                ${baseWhere} AND ${bucket.condition} AND DATE(${dateExpr}) > CURDATE()
-              `;
-            }
-            break;
-        }
-      } else {
-        // Standard query for other buckets
-        sql = `
-          SELECT
-            COUNT(*) AS totalCount,
-            SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(CURDATE()) AND MONTH(${dateExpr}) = MONTH(CURDATE()) THEN 1 ELSE 0 END) AS currentMonthCount,
-            SUM(CASE WHEN YEAR(${dateExpr}) = YEAR(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND MONTH(${dateExpr}) = MONTH(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) THEN 1 ELSE 0 END) AS prevMonthCount
-          FROM appointments
-          ${baseWhere} AND ${bucket.condition}
-        `;
-      }
-
-      const [row] = await db.query(sql, [...params, ...(bucket.params || [])]);
-      total = Number(row.totalCount) || 0;
-      currentMonth = Number(row.currentMonthCount) || 0;
-      previousMonth = Number(row.prevMonthCount) || 0;
+    for (const { key } of buckets) {
+      const total = Number(row[`${key}_total`]) || 0;
+      const currentMonth = Number(row[`${key}_current`]) || 0;
+      const previousMonth = Number(row[`${key}_previous`]) || 0;
       const growth = previousMonth === 0
         ? (currentMonth > 0 ? 100 : null)
         : ((currentMonth - previousMonth) / previousMonth) * 100;
-
-      results[bucket.key] = {
-        total,
-        currentMonth,
-        previousMonth,
-        growth,
-      };
+      results[key] = { total, currentMonth, previousMonth, growth };
     }
 
     logger.info('Dashboard stats fetched', { userId: user?.id, results });
@@ -353,7 +250,7 @@ class DashboardService {
         .replace(/\bclient_id\b/g, 'a.client_id')
         .replace(/\bassigned_technician_id\b/g, 'a.assigned_technician_id');
 
-      const appointmentsFilter = whereSql ? aliasReplace(whereSql).replace('WHERE', 'AND') : 'AND a.is_deleted = 0';
+      const appointmentsFilter = whereSql ? aliasReplace(whereSql) : 'WHERE a.is_deleted = 0';
 
       let monthFilter = '';
       const monthParams = [];
@@ -365,25 +262,38 @@ class DashboardService {
 
       const queryParams = [...params, ...monthParams];
 
-      // Center-wise breakdown
+      // An appointment belongs to both centers when they differ, and only once when they match.
+      const centerCounts = (column, distinctCenter = '') => `
+        SELECT a.${column} AS center_id,
+          COUNT(*) AS total_appointments,
+          SUM(a.status = 'completed') AS completed_appointments,
+          SUM(a.customer_category = 'HNI') AS hni_appointments,
+          SUM(a.customer_category = 'SUPER_HNI') AS super_hni_appointments
+        FROM appointments a
+        ${appointmentsFilter} ${monthFilter} AND a.${column} IS NOT NULL ${distinctCenter}
+        GROUP BY a.${column}
+      `;
       const centerSql = `
         SELECT 
           dc.id AS center_id,
           dc.center_name,
           dc.center_code,
-          COUNT(DISTINCT a.id) AS total_appointments,
-          SUM(CASE WHEN a.status = 'completed' THEN 1 ELSE 0 END) AS completed_appointments,
-          SUM(CASE WHEN a.customer_category = 'HNI' THEN 1 ELSE 0 END) AS hni_appointments,
-          SUM(CASE WHEN a.customer_category = 'SUPER_HNI' THEN 1 ELSE 0 END) AS super_hni_appointments
+          COALESCE(SUM(counts.total_appointments), 0) AS total_appointments,
+          COALESCE(SUM(counts.completed_appointments), 0) AS completed_appointments,
+          COALESCE(SUM(counts.hni_appointments), 0) AS hni_appointments,
+          COALESCE(SUM(counts.super_hni_appointments), 0) AS super_hni_appointments
         FROM diagnostic_centers dc
-        LEFT JOIN appointments a ON (a.center_id = dc.id OR a.other_center_id = dc.id)
-          ${appointmentsFilter} ${monthFilter}
+        LEFT JOIN (
+          ${centerCounts('center_id')}
+          UNION ALL
+          ${centerCounts('other_center_id', 'AND (a.center_id IS NULL OR a.center_id <> a.other_center_id)')}
+        ) counts ON counts.center_id = dc.id
         WHERE dc.is_deleted = 0
         GROUP BY dc.id, dc.center_name, dc.center_code
         ORDER BY total_appointments DESC
       `;
 
-      const centerResults = await db.query(centerSql, queryParams);
+      const centerResults = await db.query(centerSql, [...queryParams, ...queryParams]);
 
       // Client-wise (TPA) breakdown
       const tpaSql = `
@@ -396,7 +306,7 @@ class DashboardService {
           SUM(CASE WHEN a.customer_category = 'SUPER_HNI' THEN 1 ELSE 0 END) AS super_hni_appointments
         FROM clients c
         LEFT JOIN appointments a ON a.client_id = c.id
-          ${appointmentsFilter} ${monthFilter}
+          ${appointmentsFilter.replace('WHERE', 'AND')} ${monthFilter}
         WHERE c.is_deleted = 0
         GROUP BY c.id, c.client_name
         ORDER BY total_appointments DESC

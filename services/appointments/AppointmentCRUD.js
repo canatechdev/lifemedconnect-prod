@@ -6,6 +6,7 @@
 const db = require('../../lib/dbconnection');
 const { generateCustomCode } = require('../../lib/generateCode');
 const logger = require('../../lib/logger');
+const { startProbe } = require('../../lib/webPerformanceProbe'); // WEB_PERF_PROBE
 
 /**
  * Helper function to build date filter conditions
@@ -548,7 +549,7 @@ async function cloneAppointment(sourceAppointmentId, userId = null) {
 /**
  * List appointments with pagination and search
  */
-async function listAppointments({ page = 1, limit = 0, search = '', sortBy = 'id', sortOrder = 'DESC', customerCategory = '', month = '', year = '', visitType = '', status = '', medicalStatus = '', qcStatus = '', userId = null, userRole = null, dateField = 'created_at', rangeType = '', fromDate = '', toDate = '', centerIds = [], listType = 'all' }) {
+async function listAppointments({ page = 1, limit = 0, search = '', sortBy = 'id', sortOrder = 'DESC', customerCategory = '', month = '', year = '', visitType = '', status = '', medicalStatus = '', qcStatus = '', userId = null, userRole = null, dateField = 'created_at', rangeType = '', fromDate = '', toDate = '', centerIds = [], listType = 'all', includeTotal = true }) {
     const searchColumns = ['case_number', 'application_number', 'customer_first_name', 'customer_last_name', 'customer_mobile', 'customer_email', 'home_center.center_name', 'other_center.center_name', 'clients.client_name', 'insurers.insurer_name'];
     const searchParams = [];
     const conditions = [];
@@ -670,26 +671,44 @@ async function listAppointments({ page = 1, limit = 0, search = '', sortBy = 'id
     const validSortBy = allowedSortColumns.includes(sortBy) ? sortBy : 'id';
     const validSortOrder = sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
 
-    const countSql = `SELECT COUNT(DISTINCT appointments.id) as total FROM appointments 
-                    LEFT JOIN diagnostic_centers home_center ON appointments.center_id = home_center.id 
-                    LEFT JOIN diagnostic_centers other_center ON appointments.other_center_id = other_center.id
-                    LEFT JOIN clients ON appointments.client_id = clients.id
-                    LEFT JOIN insurers ON appointments.insurer_id = insurers.id
-                    LEFT JOIN appointment_tests at ON appointments.id = at.appointment_id
-                    LEFT JOIN tests t ON at.test_id = t.id
-                    LEFT JOIN test_categories tc ON t.category_id = tc.id
-                    LEFT JOIN technicians center_tech ON appointments.center_id = center_tech.center_id AND at.assigned_technician_id = center_tech.id AND at.visit_subtype = 'center'
-                    LEFT JOIN technicians home_tech ON appointments.other_center_id = home_tech.center_id AND at.assigned_technician_id = home_tech.id AND at.visit_subtype = 'home'
-                    LEFT JOIN technicians tech ON at.assigned_technician_id = tech.id
-                    LEFT JOIN users center_tech_user ON center_tech.user_id = center_tech_user.id
-                    LEFT JOIN users home_tech_user ON home_tech.user_id = home_tech_user.id
-                    LEFT JOIN users tech_user ON tech.user_id = tech_user.id${whereClause}`;
-    const [countRows] = await db.pool.query(countSql, searchParams);
-    const total = countRows[0].total;
+    // Count only joins fields referenced by current filters. Appointment/test joins
+    // previously multiplied rows during COUNT(DISTINCT), although no count filter
+    // uses those child rows. Dimension joins are needed only for the name search.
+    const countSearchJoins = search && search.trim() !== '' ? `
+        LEFT JOIN diagnostic_centers home_center ON appointments.center_id = home_center.id
+        LEFT JOIN diagnostic_centers other_center ON appointments.other_center_id = other_center.id
+        LEFT JOIN clients ON appointments.client_id = clients.id
+        LEFT JOIN insurers ON appointments.insurer_id = insurers.id` : '';
+    const countSql = `SELECT COUNT(*) as total FROM appointments${countSearchJoins}${whereClause}`;
+    // WEB_PERF_PROBE: record shapes only, never search text or customer data.
+    const probeContext = { requestId: require('crypto').randomUUID(), page: Number(page), limit: Number(limit),
+        listType, sortBy: validSortBy, sortOrder: validSortOrder,
+        hasSearch: Boolean(search), dateField, rangeType, centerFilterCount: centerIds.length,
+        hasCustomerCategory: Boolean(customerCategory), hasVisitType: Boolean(visitType),
+        hasStatus: Boolean(status), hasMedicalStatus: Boolean(medicalStatus), hasQcStatus: Boolean(qcStatus) };
+    let total = null;
+    if (includeTotal) {
+        const countProbe = startProbe('web.list.count', probeContext);
+        const [countRows] = await db.pool.query(countSql, searchParams);
+        total = countRows[0].total;
+        countProbe({ total: Number(total) });
+    }
 
     const numericLimit = Number(limit);
     const numericPage = Number(page);
     
+    const orderBy = `ORDER BY appointments.${validSortBy} ${validSortOrder}` +
+        (validSortBy === 'id' ? '' : `, appointments.id ${validSortOrder}`);
+    const paginated = Number.isInteger(numericLimit) && numericLimit > 0 &&
+        Number.isInteger(numericPage) && numericPage > 0;
+    // LIMIT inside the derived table bounds the display joins to this page.
+    const pageSource = paginated ? `(
+        SELECT appointments.id
+        FROM appointments${countSearchJoins}${whereClause}
+        ${orderBy}
+        LIMIT ? OFFSET ?
+    ) page_ids STRAIGHT_JOIN appointments ON appointments.id = page_ids.id` : 'appointments';
+
     let sql = `SELECT 
                 appointments.*,
                 home_center.center_name as home_center_name,
@@ -721,7 +740,7 @@ async function listAppointments({ page = 1, limit = 0, search = '', sortBy = 'id
                     THEN tech.full_name
                     ELSE NULL 
                 END) as all_technicians
-                FROM appointments 
+                FROM ${pageSource}
                 LEFT JOIN diagnostic_centers home_center ON appointments.center_id = home_center.id
                 LEFT JOIN diagnostic_centers other_center ON appointments.other_center_id = other_center.id
                 LEFT JOIN clients ON appointments.client_id = clients.id
@@ -734,18 +753,20 @@ async function listAppointments({ page = 1, limit = 0, search = '', sortBy = 'id
                 LEFT JOIN technicians tech ON at.assigned_technician_id = tech.id
                 LEFT JOIN users center_tech_user ON center_tech.user_id = center_tech_user.id
                 LEFT JOIN users home_tech_user ON home_tech.user_id = home_tech_user.id
-                ${whereClause} 
+                ${paginated ? '' : whereClause}
                 GROUP BY appointments.id
-                ORDER BY ${validSortBy} ${validSortOrder}`;
+                ${orderBy}`;
     let dataParams = [...searchParams];
     
     if (!isNaN(numericLimit) && numericLimit > 0) {
         const offset = (numericPage - 1) * numericLimit;
-        sql += ` LIMIT ? OFFSET ?`;
+        if (!paginated) sql += ` LIMIT ? OFFSET ?`;
         dataParams.push(numericLimit, offset);
     }
 
+    const dataProbe = startProbe('web.list.data', probeContext);
     const [rows] = await db.pool.query(sql, dataParams);
+    dataProbe({ rows: rows.length });
 
     return {
         data: rows,
@@ -753,7 +774,7 @@ async function listAppointments({ page = 1, limit = 0, search = '', sortBy = 'id
             total,
             page: numericPage,
             limit: numericLimit,
-            pages: numericLimit > 0 ? Math.ceil(total / numericLimit) : 1,
+            pages: total === null ? null : numericLimit > 0 ? Math.ceil(total / numericLimit) : 1,
         },
     };
 }

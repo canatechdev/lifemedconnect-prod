@@ -1,17 +1,18 @@
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
-const crypto = require('crypto');
 const ExcelJS = require('exceljs');
 const db = require('../../lib/dbconnection');
 const logger = require('../../lib/logger');
+const { startProbe } = require('../../lib/webPerformanceProbe'); // WEB_PERF_PROBE
 const { createZipFile, normalizeZipName } = require('../../lib/simpleZip');
 const appointmentExcel = require('./AppointmentExcel');
 const { getExportRemarksByAppointmentIds } = require('./AppointmentExportRemarks');
 
 const APP_ROOT = path.resolve(__dirname, '../../');
 const EXPORT_ROOT = path.join(APP_ROOT, 'storage_backups', 'appointment_exports');
-const EXPORT_RETENTION_HOURS = 24;
+const EXPORT_DOWNLOAD_WINDOW_MINUTES = 30;
+const EXPORT_DOWNLOAD_LEASE_HOURS = 2;
 const EXPORT_CHUNK_SIZE = 5000;
 const EXPORT_MAX_ROWS_PER_FILE = 1000000;
 const TERMINAL_STATUSES = new Set(['ready', 'completed', 'failed', 'expired', 'cancelled', 'manual_deleted']);
@@ -146,37 +147,10 @@ function scopeFromUser(user = {}) {
 }
 
 async function createExportJob(req, filters) {
-    const scope = scopeFromUser(req.user);
-    const requestKey = crypto.createHash('sha256')
-        .update(JSON.stringify({ filters: filters || {}, scope }))
-        .digest('hex');
-    const existing = await db.query(
-        `SELECT * FROM storage_backup_activity
-         WHERE job_type = 'appointment_export'
-           AND performed_by = ?
-           AND status IN ('queued', 'processing', 'ready')
-           AND (status <> 'ready' OR expires_at IS NULL OR expires_at > NOW())
-           AND JSON_UNQUOTE(JSON_EXTRACT(metadata_json, '$.request_key')) = ?
-         ORDER BY id DESC LIMIT 1`,
-        [req.user.id, requestKey]
-    );
-    if (existing[0]) {
-        const existingPath = safeExportPath(existing[0].file_path);
-        if (existing[0].status !== 'ready' || (existingPath && fs.existsSync(existingPath))) {
-            return formatJob(existing[0]);
-        }
-        await db.query(
-            `UPDATE storage_backup_activity
-             SET status = 'expired', deleted_at = NOW(), error_message = 'Retained export file is no longer available'
-             WHERE id = ? AND status = 'ready'`,
-            [existing[0].id]
-        );
-    }
-
+    // Identical filters do not imply identical data, even when another job is running.
     const metadata = {
         filters: filters || {},
-        scope,
-        request_key: requestKey,
+        scope: scopeFromUser(req.user),
         progress_percent: 0,
         progress_message: 'Queued',
         progress_current: 0,
@@ -263,6 +237,7 @@ async function processExportJob(jobId) {
         [jobId]
     );
     if (!claimed.affectedRows) return;
+    const jobProbe = startProbe('export.job', { jobId }, 0);
 
     const metadata = safeJson(job.metadata_json, {});
     const filters = metadata.filters || {};
@@ -283,12 +258,14 @@ async function processExportJob(jobId) {
             snapshotMaxId = Number(maxRows[0]?.max_id || 0);
         }
         if (!totalRows) {
+            const countProbe = startProbe('export.count', { jobId }, 0);
             const countRows = await appointmentExcel.getAppointmentsForExport(
                 filters,
                 scope,
                 { maxId: snapshotMaxId, countOnly: true }
             );
             totalRows = Number(countRows[0]?.total || 0);
+            countProbe({ totalRows });
         }
 
         const updateProgress = async (message, current = rowCount) => {
@@ -307,11 +284,13 @@ async function processExportJob(jobId) {
         };
 
         while (true) {
+            const queryProbe = startProbe('export.query', { jobId, afterId }, 0);
             const rows = await appointmentExcel.getAppointmentsForExport(
                 filters,
                 scope,
                 { afterId, maxId: snapshotMaxId, limit: EXPORT_CHUNK_SIZE }
             );
+            queryProbe({ rows: rows.length });
             if (!rows.length) break;
 
             if (!workbookPart || workbookPart.rows + rows.length > EXPORT_MAX_ROWS_PER_FILE) {
@@ -323,7 +302,10 @@ async function processExportJob(jobId) {
                 partFiles.push({ fileName, filePath });
             }
 
-            const remarks = await getExportRemarksByAppointmentIds(rows.map(row => row.id));
+            const remarksProbe = startProbe('export.remarks', { jobId, afterId }, 0);
+            const remarks = await getExportRemarksByAppointmentIds(rows.map(row => row.id), rows);
+            remarksProbe({ rows: rows.length });
+            const writeProbe = startProbe('export.write', { jobId, afterId }, 0);
             for (const row of rows) {
                 const exportRow = workbookPart.worksheet.addRow(toExportRow(row, remarks.get(Number(row.id)) || ''));
                 applyBorders(exportRow);
@@ -332,11 +314,14 @@ async function processExportJob(jobId) {
                 rowCount += 1;
             }
             afterId = Number(rows[rows.length - 1].id);
+            writeProbe({ rowCount });
             await updateProgress(`Processed ${rowCount.toLocaleString()} appointments`);
             await new Promise(resolve => setImmediate(resolve));
         }
 
+        const commitProbe = startProbe('export.commit', { jobId }, 0);
         if (workbookPart) await workbookPart.workbook.commit();
+        commitProbe();
         if (!partFiles.length) {
             const fileName = `appointments_export_${jobId}_part_001.xlsx`;
             const filePath = path.join(jobDir, fileName);
@@ -348,6 +333,7 @@ async function processExportJob(jobId) {
         let finalPath = partFiles[0].filePath;
         let finalName = partFiles[0].fileName;
         if (partFiles.length > 1) {
+            const zipProbe = startProbe('export.zip', { jobId }, 0);
             finalName = `appointments_export_${jobId}.zip`;
             finalPath = path.join(jobDir, finalName);
             await createZipFile(finalPath, partFiles.map(part => ({
@@ -355,6 +341,7 @@ async function processExportJob(jobId) {
                 name: normalizeZipName(part.fileName),
             })));
             await Promise.all(partFiles.map(part => fsp.unlink(part.filePath).catch(() => undefined)));
+            zipProbe({ partCount: partFiles.length });
         }
 
         const stat = await fsp.stat(finalPath);
@@ -378,11 +365,13 @@ async function processExportJob(jobId) {
             total_files: partFiles.length,
             total_size: stat.size,
             metadata_json: JSON.stringify(finalMetadata),
-            expires_at: new Date(Date.now() + EXPORT_RETENTION_HOURS * 60 * 60 * 1000),
+            expires_at: new Date(Date.now() + EXPORT_DOWNLOAD_WINDOW_MINUTES * 60 * 1000),
             error_message: null,
         });
         logger.info('Appointment export job completed', { jobId, rowCount, partCount: partFiles.length, bytes: stat.size });
+        jobProbe({ rowCount, bytes: stat.size });
     } catch (error) {
+        jobProbe({ failed: true, code: error.code, rowCount });
         if (workbookPart) await workbookPart.workbook.commit().catch(() => undefined);
         await updateJob(jobId, {
             status: 'failed',
@@ -394,17 +383,38 @@ async function processExportJob(jobId) {
     }
 }
 
+async function removeExportFile(jobId, filePath) {
+    const absolute = safeExportPath(filePath);
+    const jobDir = path.join(EXPORT_ROOT, `job_${Number(jobId)}`);
+    if (!absolute || path.dirname(absolute) !== jobDir) {
+        throw new Error('Invalid export job file path');
+    }
+    await fsp.rm(jobDir, { recursive: true, force: true });
+    await db.query(
+        `UPDATE storage_backup_activity SET deleted_at = NOW()
+         WHERE id = ? AND job_type = 'appointment_export' AND status = 'expired' AND deleted_at IS NULL`,
+        [jobId]
+    );
+}
+
 async function cleanupExpiredExports() {
     const rows = await db.query(
-        `SELECT id, file_path FROM storage_backup_activity
-         WHERE job_type = 'appointment_export' AND status = 'ready'
-           AND expires_at IS NOT NULL AND expires_at <= NOW()
+        `SELECT id, file_path, status FROM storage_backup_activity
+         WHERE job_type = 'appointment_export' AND deleted_at IS NULL
+           AND (status = 'expired' OR (status IN ('ready', 'downloading') AND expires_at <= NOW()))
          LIMIT 50`
     );
     for (const row of rows) {
-        const absolute = safeExportPath(row.file_path);
-        if (absolute) await fsp.rm(path.dirname(absolute), { recursive: true, force: true }).catch(() => undefined);
-        await db.query(`UPDATE storage_backup_activity SET status = 'expired', deleted_at = NOW() WHERE id = ?`, [row.id]);
+        try {
+            const claim = await db.query(
+                `UPDATE storage_backup_activity SET status = 'expired'
+                 WHERE id = ? AND job_type = 'appointment_export' AND status IN ('ready', 'downloading') AND expires_at <= NOW()`,
+                [row.id]
+            );
+            if (claim.affectedRows || row.status === 'expired') await removeExportFile(row.id, row.file_path);
+        } catch (error) {
+            logger.warn('Could not clean up appointment export', { jobId: row.id, code: error.code });
+        }
     }
 }
 
@@ -436,12 +446,61 @@ async function downloadExport(req, res, jobId) {
         error.statusCode = 404;
         throw error;
     }
-    await db.query('UPDATE storage_backup_activity SET downloaded_at = NOW() WHERE id = ?', [jobId]);
+    if (req.method !== 'GET') return res.sendStatus(405);
+    // Give an accepted transfer time to finish without letting the cleanup worker remove its file.
+    const claim = await db.query(
+        `UPDATE storage_backup_activity SET status = 'downloading', expires_at = ?
+         WHERE id = ? AND job_type = 'appointment_export' AND status = 'ready'
+           AND (expires_at IS NULL OR expires_at > NOW())`,
+        [new Date(Date.now() + EXPORT_DOWNLOAD_LEASE_HOURS * 60 * 60 * 1000), jobId]
+    );
+    if (!claim.affectedRows) return res.sendStatus(409);
     const contentType = job.file_name?.endsWith('.zip') ? 'application/zip' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
     res.setHeader('Content-Type', contentType);
     res.setHeader('Content-Disposition', `attachment; filename="${job.file_name}"`);
     res.setHeader('Cache-Control', 'no-store');
-    return res.sendFile(absolute);
+    return new Promise((resolve, reject) => {
+        let finalized = false;
+        const onFinished = () => finalize();
+        async function finalize(error) {
+            if (finalized) return;
+            finalized = true;
+            res.removeListener('finish', onFinished);
+            res.removeListener('close', onFinished);
+            const completed = !error && res.statusCode === 200 && res.writableFinished;
+            try {
+                if (completed) {
+                    const result = await db.query(
+                        `UPDATE storage_backup_activity
+                         SET status = 'expired', downloaded_at = NOW(), expires_at = NOW()
+                         WHERE id = ? AND job_type = 'appointment_export' AND status = 'downloading'`,
+                        [jobId]
+                    );
+                    if (result.affectedRows) await removeExportFile(jobId, job.file_path);
+                } else {
+                    await db.query(
+                        `UPDATE storage_backup_activity SET status = 'ready', expires_at = ?
+                         WHERE id = ? AND job_type = 'appointment_export' AND status = 'downloading'`,
+                        [job.expires_at, jobId]
+                    );
+                }
+            } catch (cleanupError) {
+                logger.warn('Could not finalize appointment export download', { jobId, code: cleanupError.code });
+            }
+            if (error && !res.destroyed) {
+                if (!res.headersSent) return reject(error);
+                if (!res.writableEnded) res.destroy(error);
+            }
+            resolve();
+        }
+        // Reading the last byte from disk is not the same as finishing the HTTP response.
+        res.once('finish', onFinished);
+        res.once('close', onFinished);
+        if (res.destroyed) return finalize();
+        res.sendFile(absolute, { acceptRanges: false, lastModified: false, etag: false }, (error) => {
+            if (error) finalize(error);
+        });
+    });
 }
 
 let recoveredStaleJobs = false;
@@ -471,5 +530,4 @@ module.exports = {
     processExportJob,
     runWorkerOnce,
     cleanupExpiredExports,
-    EXPORT_RETENTION_HOURS,
 };

@@ -779,20 +779,20 @@ async function getAppointmentsForExport(filters = {}, user = null, options = {})
 
         if (options.countOnly) {
             const countSql = `
-                SELECT COUNT(DISTINCT a.id) AS total
+                SELECT COUNT(*) AS total
                 FROM appointments a
-                LEFT JOIN clients c ON a.client_id = c.id
-                LEFT JOIN diagnostic_centers dc ON a.center_id = dc.id
-                LEFT JOIN diagnostic_centers odc ON a.other_center_id = odc.id
-                LEFT JOIN insurers i ON a.insurer_id = i.id
-                LEFT JOIN users creator ON a.created_by = creator.id
-                LEFT JOIN users updater ON a.updated_by = updater.id
                 ${whereClause}
             `;
             return await db.query(countSql, params);
         }
 
-        const sql = `
+        const sql = chunkClause ? `
+            WITH batch AS (
+                SELECT a.id
+                FROM appointments a
+                ${whereClause}
+                ${orderClause}${chunkClause}
+            )
             SELECT 
                 a.*,
                 c.client_name,
@@ -801,14 +801,26 @@ async function getAppointmentsForExport(filters = {}, user = null, options = {})
                 i.insurer_name,
                 creator.full_name as created_by_name,
                 updater.full_name as updated_by_name,
-                -- Aggregate tests information
-                (
-                    SELECT GROUP_CONCAT(
+                test_aggregates.tests_info,
+                test_aggregates.categories_info,
+                test_aggregates.technicians_info,
+                COALESCE(test_aggregates.test_count, 0) AS test_count
+            FROM batch b
+            JOIN appointments a ON a.id = b.id
+            LEFT JOIN clients c ON a.client_id = c.id
+            LEFT JOIN diagnostic_centers dc ON a.center_id = dc.id
+            LEFT JOIN diagnostic_centers odc ON a.other_center_id = odc.id
+            LEFT JOIN insurers i ON a.insurer_id = i.id
+            LEFT JOIN users creator ON a.created_by = creator.id
+            LEFT JOIN users updater ON a.updated_by = updater.id
+            LEFT JOIN (
+                SELECT at.appointment_id,
+                    GROUP_CONCAT(
                         DISTINCT CONCAT(
                             COALESCE(at.item_name, COALESCE(t.test_name, '')), 
                             CASE 
-                                WHEN tc.category_name IS NOT NULL AND tc.category_name != '' THEN
-                                    CONCAT(' (', tc.category_name, ')')
+                                WHEN NULLIF(category_match.category_name, '') IS NOT NULL THEN
+                                    CONCAT(' (', category_match.category_name, ')')
                                 ELSE ''
                             END,
                             CASE 
@@ -817,43 +829,50 @@ async function getAppointmentsForExport(filters = {}, user = null, options = {})
                                 ELSE ''
                             END
                         )
-                        ORDER BY COALESCE(tc.category_name, ''), at.item_name
+                        ORDER BY COALESCE(category_match.category_name, ''), at.item_name
                         SEPARATOR ' | '
+                    ) AS tests_info,
+                    GROUP_CONCAT(DISTINCT explicit_category.category_name
+                        ORDER BY explicit_category.category_name SEPARATOR ', ') AS categories_info,
+                    GROUP_CONCAT(DISTINCT tech.full_name
+                        ORDER BY tech.full_name SEPARATOR ', ') AS technicians_info,
+                    COUNT(DISTINCT at.id) AS test_count
+                FROM batch b
+                STRAIGHT_JOIN appointment_tests at ON b.id = at.appointment_id
+                LEFT JOIN tests t ON at.test_id = t.id AND t.is_deleted = 0
+                LEFT JOIN test_categories explicit_category ON explicit_category.id = at.category_id AND explicit_category.is_deleted = 0
+                LEFT JOIN test_categories inherited_category ON inherited_category.id = t.category_id AND inherited_category.is_deleted = 0
+                LEFT JOIN technicians tech ON at.assigned_technician_id = tech.id AND tech.is_deleted = 0
+                -- Emit a second match only if both live categories exist and differ.
+                JOIN (SELECT 0 AS extra UNION ALL SELECT 1) category_slot
+                    ON category_slot.extra = 0 OR (
+                        explicit_category.id IS NOT NULL AND inherited_category.id <> explicit_category.id
                     )
-                    FROM appointment_tests at
-                    LEFT JOIN tests t ON at.test_id = t.id AND t.is_deleted = 0
+                LEFT JOIN test_categories category_match ON category_match.id = CASE
+                    WHEN category_slot.extra = 1 THEN inherited_category.id
+                    ELSE COALESCE(explicit_category.id, inherited_category.id)
+                END
+                GROUP BY at.appointment_id
+            ) test_aggregates ON test_aggregates.appointment_id = a.id
+            ORDER BY a.id ASC
+        ` : `
+            SELECT a.*, c.client_name, dc.center_name, odc.center_name AS other_center_name,
+                   i.insurer_name, creator.full_name AS created_by_name, updater.full_name AS updated_by_name,
+                   (SELECT GROUP_CONCAT(DISTINCT CONCAT(COALESCE(at.item_name, COALESCE(t.test_name, '')),
+                       CASE WHEN tc.category_name IS NOT NULL AND tc.category_name != '' THEN CONCAT(' (', tc.category_name, ')') ELSE '' END,
+                       CASE WHEN at.assigned_technician_id IS NOT NULL THEN CONCAT(' [Tech: ', COALESCE(tech.full_name, ''), ']') ELSE '' END)
+                       ORDER BY COALESCE(tc.category_name, ''), at.item_name SEPARATOR ' | ')
+                    FROM appointment_tests at LEFT JOIN tests t ON at.test_id = t.id AND t.is_deleted = 0
                     LEFT JOIN test_categories tc ON (at.category_id = tc.id OR t.category_id = tc.id) AND tc.is_deleted = 0
                     LEFT JOIN technicians tech ON at.assigned_technician_id = tech.id AND tech.is_deleted = 0
-                    WHERE at.appointment_id = a.id
-                ) as tests_info,
-                -- Aggregate categories only
-                (
-                    SELECT GROUP_CONCAT(
-                        DISTINCT COALESCE(tc.category_name, '')
-                        ORDER BY tc.category_name
-                        SEPARATOR ', '
-                    )
-                    FROM appointment_tests at
-                    LEFT JOIN test_categories tc ON (at.category_id = tc.id) AND tc.is_deleted = 0
-                    WHERE at.appointment_id = a.id AND tc.category_name IS NOT NULL
-                ) as categories_info,
-                -- Aggregate technicians only
-                (
-                    SELECT GROUP_CONCAT(
-                        DISTINCT COALESCE(tech.full_name, '')
-                        ORDER BY tech.full_name
-                        SEPARATOR ', '
-                    )
-                    FROM appointment_tests at
-                    LEFT JOIN technicians tech ON at.assigned_technician_id = tech.id AND tech.is_deleted = 0
-                    WHERE at.appointment_id = a.id AND tech.full_name IS NOT NULL
-                ) as technicians_info,
-                -- Count of tests
-                (
-                    SELECT COUNT(*)
-                    FROM appointment_tests at
-                    WHERE at.appointment_id = a.id
-                ) as test_count
+                    WHERE at.appointment_id = a.id) AS tests_info,
+                   (SELECT GROUP_CONCAT(DISTINCT COALESCE(tc.category_name, '') ORDER BY tc.category_name SEPARATOR ', ')
+                    FROM appointment_tests at LEFT JOIN test_categories tc ON at.category_id = tc.id AND tc.is_deleted = 0
+                    WHERE at.appointment_id = a.id AND tc.category_name IS NOT NULL) AS categories_info,
+                   (SELECT GROUP_CONCAT(DISTINCT COALESCE(tech.full_name, '') ORDER BY tech.full_name SEPARATOR ', ')
+                    FROM appointment_tests at LEFT JOIN technicians tech ON at.assigned_technician_id = tech.id AND tech.is_deleted = 0
+                    WHERE at.appointment_id = a.id AND tech.full_name IS NOT NULL) AS technicians_info,
+                   (SELECT COUNT(*) FROM appointment_tests at WHERE at.appointment_id = a.id) AS test_count
             FROM appointments a
             LEFT JOIN clients c ON a.client_id = c.id
             LEFT JOIN diagnostic_centers dc ON a.center_id = dc.id
@@ -862,7 +881,7 @@ async function getAppointmentsForExport(filters = {}, user = null, options = {})
             LEFT JOIN users creator ON a.created_by = creator.id
             LEFT JOIN users updater ON a.updated_by = updater.id
             ${whereClause}
-            ${orderClause}${chunkClause}
+            ORDER BY a.created_at DESC
         `;
 
         const appointments = await db.query(sql, params);

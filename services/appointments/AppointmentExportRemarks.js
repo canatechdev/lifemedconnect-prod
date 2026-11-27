@@ -1,20 +1,22 @@
 const db = require('../../lib/dbconnection');
 const logger = require('../../lib/logger');
 
+const istDateTimeFormatter = new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true
+});
+
 function formatIstDateTime(value) {
     if (!value) return '';
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value);
 
-    return new Intl.DateTimeFormat('en-IN', {
-        timeZone: 'Asia/Kolkata',
-        day: '2-digit',
-        month: 'short',
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: true
-    }).format(date).replace(',', '') + ' IST';
+    return istDateTimeFormatter.format(date).replace(',', '') + ' IST';
 }
 
 function titleCase(value) {
@@ -60,7 +62,7 @@ function addRemarkEntry(map, appointmentId, timestamp, label, remarks) {
     });
 }
 
-async function getExportRemarksByAppointmentIds(appointmentIds = []) {
+async function getExportRemarksByAppointmentIds(appointmentIds = [], prefetchedAppointments) {
     const ids = [...new Set(appointmentIds.map((id) => Number(id)).filter(Boolean))];
     const remarksMap = new Map();
     if (ids.length === 0) return remarksMap;
@@ -68,7 +70,8 @@ async function getExportRemarksByAppointmentIds(appointmentIds = []) {
     const placeholders = ids.map(() => '?').join(',');
 
     try {
-        const appointmentRows = await db.query(
+        // Queued exports already have these fields in the batch's appointment rows.
+        const appointmentRows = prefetchedAppointments ?? await db.query(
             `SELECT id, remarks, medical_remarks, reschedule_remark, center_reschedule_remark, home_reschedule_remark,
                     pushback_remarks, center_pushback_remarks, home_pushback_remarks, created_at, updated_at, pushed_back_at
              FROM appointments
@@ -88,7 +91,7 @@ async function getExportRemarksByAppointmentIds(appointmentIds = []) {
         });
 
         const historyRows = await db.query(
-            `SELECT appointment_id, change_type, old_status, new_status, old_medical_status, new_medical_status,
+            `SELECT appointment_id, change_type, new_medical_status,
                     remarks, created_at
              FROM appointment_status_history
              WHERE appointment_id IN (${placeholders})

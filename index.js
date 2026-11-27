@@ -372,10 +372,10 @@ server.listen(PORT, async () => {
         logger.error('Technician unavailable escalation monitor could not start', { message: error.message });
     }
 
-    // Run large appointment exports in a separate process so PDF/export work cannot block API requests.
+    // The export worker reads serially and owns a separate pool from the web process.
     try {
         appointmentExportWorker = fork(path.join(__dirname, 'services/appointments/appointmentExportWorker.js'), [], {
-            env: process.env,
+            env: { ...process.env, DB_CONNECTION_LIMIT: '1' },
             stdio: 'ignore'
         });
         appointmentExportWorker.on('exit', (code, signal) => {

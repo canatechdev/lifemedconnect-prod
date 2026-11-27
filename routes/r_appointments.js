@@ -464,7 +464,8 @@ router.get('/appointments', verifyToken, requirePermission('appointments.view'),
         rangeType,
         fromDate,
         toDate,
-        centerIds
+        centerIds,
+        includeTotal: req.query.includeTotal !== 'false'
     });
     return ApiResponse.paginated(res, result.data, result.pagination);
 }));
