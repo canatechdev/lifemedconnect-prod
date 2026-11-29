@@ -32,6 +32,7 @@ const { uploadLimiter } = require('../middleware/security');
 
 // Import service
 const service = require('../services/appointments');
+const appointmentExportJobs = require('../services/appointments/AppointmentExportJob');
 
 // Helper: Look up case_number for file organization
 async function getCaseNumber(appointmentId) {
@@ -143,7 +144,51 @@ router.get('/appointments/sample-template',
     res.end();
 }));
 
-// Export Appointments with Filters
+// Queue appointment export with filters. The worker creates the file outside the HTTP request.
+router.post('/appointments/export/jobs',
+    verifyToken,
+    requirePermission('appointments.export'),
+    asyncHandler(async (req, res) => {
+        const filters = {
+            month: req.body?.month,
+            year: req.body?.year,
+            customerCategory: req.body?.customerCategory,
+            visitType: req.body?.visitType,
+            status: req.body?.status,
+            medicalStatus: req.body?.medicalStatus,
+            qcStatus: req.body?.qcStatus,
+            search: req.body?.q,
+            dateField: req.body?.dateField || 'created_at',
+            rangeType: req.body?.rangeType || '',
+            fromDate: req.body?.fromDate || '',
+            toDate: req.body?.toDate || '',
+            centerIds: Array.isArray(req.body?.centerIds)
+                ? req.body.centerIds.filter(Boolean)
+                : String(req.body?.centerIds || '').split(',').filter(Boolean),
+        };
+        const job = await appointmentExportJobs.createExportJob(req, filters);
+        return ApiResponse.success(res, job, 'Appointment export queued successfully', 202);
+    })
+);
+
+router.get('/appointments/export/jobs/:id',
+    verifyToken,
+    requirePermission('appointments.export'),
+    asyncHandler(async (req, res) => {
+        const job = await appointmentExportJobs.getExportJob(req.params.id, req);
+        if (!job) return ApiResponse.notFound(res, 'Export job not found');
+        return ApiResponse.success(res, job, 'Appointment export status retrieved');
+    })
+);
+
+router.get('/appointments/export/jobs/:id/download',
+    verifyToken,
+    requirePermission('appointments.export'),
+    asyncHandler(async (req, res) => appointmentExportJobs.downloadExport(req, res, req.params.id))
+);
+
+// Legacy synchronous export retained for compatibility with external callers.
+// The CRM appointment page uses the queued export endpoints above.
 router.get('/appointments/export',
     verifyToken,
     requirePermission('appointments.export'),

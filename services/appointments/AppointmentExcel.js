@@ -652,7 +652,7 @@ async function processUploadedFile(filePath, user) {
  * Get all appointments for export (no pagination)
  * Supports comprehensive filtering including month/year
  */
-async function getAppointmentsForExport(filters = {}, user = null) {
+async function getAppointmentsForExport(filters = {}, user = null, options = {}) {
     try {
         const {
             month,
@@ -759,7 +759,38 @@ async function getAppointmentsForExport(filters = {}, user = null) {
             params.push(like, like, like, like, like);
         }
 
+        // Export jobs use the primary-key boundary for stable chunking. The legacy
+        // caller omits these options and keeps the original full-export behavior.
+        if (Number.isFinite(Number(options.afterId))) {
+            conditions.push('a.id > ?');
+            params.push(Number(options.afterId));
+        }
+        if (Number.isFinite(Number(options.maxId))) {
+            conditions.push('a.id <= ?');
+            params.push(Number(options.maxId));
+        }
+
         const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+        const chunkLimit = Number(options.limit);
+        const chunkClause = Number.isFinite(chunkLimit) && chunkLimit > 0
+            ? ` LIMIT ${Math.min(Math.floor(chunkLimit), 5000)}`
+            : '';
+        const orderClause = chunkClause ? 'ORDER BY a.id ASC' : 'ORDER BY a.created_at DESC';
+
+        if (options.countOnly) {
+            const countSql = `
+                SELECT COUNT(DISTINCT a.id) AS total
+                FROM appointments a
+                LEFT JOIN clients c ON a.client_id = c.id
+                LEFT JOIN diagnostic_centers dc ON a.center_id = dc.id
+                LEFT JOIN diagnostic_centers odc ON a.other_center_id = odc.id
+                LEFT JOIN insurers i ON a.insurer_id = i.id
+                LEFT JOIN users creator ON a.created_by = creator.id
+                LEFT JOIN users updater ON a.updated_by = updater.id
+                ${whereClause}
+            `;
+            return await db.query(countSql, params);
+        }
 
         const sql = `
             SELECT 
@@ -831,7 +862,7 @@ async function getAppointmentsForExport(filters = {}, user = null) {
             LEFT JOIN users creator ON a.created_by = creator.id
             LEFT JOIN users updater ON a.updated_by = updater.id
             ${whereClause}
-            ORDER BY a.created_at DESC
+            ${orderClause}${chunkClause}
         `;
 
         const appointments = await db.query(sql, params);

@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
+const { fork } = require('child_process');
 const path = require('path');
 const cors = require('cors');
 const compression = require('compression');
@@ -55,6 +56,7 @@ testConnection()
 
 const config = getConfig();
 const app = express();
+let appointmentExportWorker = null;
 
 // Trust proxy for Nginx/Apache reverse proxy
 app.set('trust proxy', 1);
@@ -296,6 +298,11 @@ app.use(errorHandler);
 const gracefulShutdown = async () => {
     logger.info('Received shutdown signal, closing server gracefully...');
 
+    if (appointmentExportWorker) {
+        appointmentExportWorker.kill('SIGTERM');
+        appointmentExportWorker = null;
+    }
+
     server.close(async () => {
         logger.info('HTTP server closed');
 
@@ -363,6 +370,21 @@ server.listen(PORT, async () => {
         startTechnicianUnavailabilityEscalationMonitor();
     } catch (error) {
         logger.error('Technician unavailable escalation monitor could not start', { message: error.message });
+    }
+
+    // Run large appointment exports in a separate process so PDF/export work cannot block API requests.
+    try {
+        appointmentExportWorker = fork(path.join(__dirname, 'services/appointments/appointmentExportWorker.js'), [], {
+            env: process.env,
+            stdio: 'ignore'
+        });
+        appointmentExportWorker.on('exit', (code, signal) => {
+            logger.warn('Appointment export worker exited', { code, signal });
+            appointmentExportWorker = null;
+        });
+        logger.info('Appointment export worker started', { pid: appointmentExportWorker.pid });
+    } catch (error) {
+        logger.error('Appointment export worker could not start', { error: error.message });
     }
 });
 
